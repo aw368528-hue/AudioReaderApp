@@ -28,7 +28,7 @@ with sync_playwright() as playwright:
     browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', args=['--no-sandbox'])
     for fixture, mode, query in [(fixture, mode, query) for fixture in ['wrapped_document', 'metadata_document']
                            for mode in ['manual', 'txt', 'pdf', 'docx']
-                           for query in ['', '?test=1&buffer=0', '?test=1&buffer=2']]:
+                           for query in ['', '?buffer=0', '?test=1&buffer=0', '?test=1&buffer=2']]:
         expected = json.loads((root / (fixture + '.expected.json')).read_text())
         page = browser.new_page(viewport={'width': 393, 'height': 852})
         page.add_init_script('''
@@ -92,6 +92,7 @@ with sync_playwright() as playwright:
 
         page.route('**/*', route_request)
         page.goto('https://reader.test/' + query)
+        assert page.evaluate('bufferMode') == (0 if 'buffer=0' in query else 2)
         if mode == 'manual':
             page.evaluate("window.switchTab('editor')")
             page.locator('#rawText').fill((root / (fixture + '.txt')).read_text())
@@ -115,7 +116,7 @@ with sync_playwright() as playwright:
         assert probe['unsafeReleases'] == [], probe
         assert sorted(probe['created']) == sorted(probe['revoked']), probe
         assert page.evaluate('prefetchCache.size') == 0
-        if query:
+        if 'test=1' in query:
             report = page.evaluate('diagnosticReport()')
             assert report['gaps']['count'] == len(expected) - 1, report
             assert report['failed_transitions'] == 0, report

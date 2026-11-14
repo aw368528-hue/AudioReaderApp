@@ -10,7 +10,9 @@ clearAudioCache oraz dopisywanych testów; zachowano segmentację i jej regresje
 
 ## Zachowanie
 
-- Standardowy adres: brak panelu, brak diagnostyki, brak prefetch.
+- Standardowy adres: bufor dwóch następnych fragmentów, bez panelu i diagnostyki.
+- `?buffer=0`: awaryjne wyłączenie prefetch bez włączania diagnostyki.
+  Brak parametru, `buffer=2` lub inna wartość pozostawia domyślny bufor dwóch.
 - `?test=1&buffer=0`: pomiary, przygotowanie fragmentu dopiero po końcu poprzedniego.
 - `?test=1&buffer=2`: pomiary i przygotowanie maksymalnie dwóch następnych
   fragmentów podczas bieżącego odczytu. Samo `?buffer=2` nie włącza testu.
@@ -108,16 +110,18 @@ main nie ma jeszcze tych zmian; w tej pracy nie uruchomiono wdrożenia.
    waiting/stalled i czasy fetch. Samo hidden nie dowodzi blokady ekranu.
    Opóźnienie callbacków w tle może zafałszować pomiar rzeczywistej ciszy;
    niezależny odsłuch/nagranie zewnętrzne jest potrzebne do potwierdzenia.
-7. Aby wyłączyć diagnostykę i prefetch, usuń parametry `test` i `buffer` z adresu
-   i otwórz stronę ponownie (ewentualnie użyj `?test=0`). Samo przełączenie
-   na buffer=0 wyłącza prefetch, ale pozostawia diagnostykę aktywną. Najpierw
-   pobierz raport, ponieważ ponowne otwarcie strony usuwa dotychczasowe pomiary.
+7. Aby wyłączyć diagnostykę, usuń `test=1` i otwórz stronę ponownie (lub użyj
+   `test=0`). Bufor nadal działa domyślnie. Aby awaryjnie wyłączyć także bufor,
+   otwórz `?buffer=0` bez `test=1`. Samo przełączenie bufora w panelu na 0 nie
+   wyłącza diagnostyki. Przed ponownym otwarciem strony pobierz raport, ponieważ
+   ta operacja usuwa dotychczasowe pomiary.
 
 ## Weryfikacja lokalna
 
-- 17 testów Python, w tym uruchomione 57 testów JavaScript: PASS.
-- 32 scenariusze Chromium: 24 przebiegi importu/odczytu (dwa komplety
-  TXT/PDF/DOCX i wklejanie ręczne, standardowo oraz buffer=0/2) oraz 8 kontroli
+- 17 testów Python, w tym uruchomione 58 testów JavaScript: PASS.
+- 40 scenariuszy Chromium: 32 przebiegi importu/odczytu (dwa komplety
+  TXT/PDF/DOCX i wklejanie ręczne; standardowo, awaryjne `?buffer=0`,
+  testowe buffer=0/2) oraz 8 kontroli
   panelu (360×640 i 393×852, buffer=0/2, lektor/edytor): PASS.
   Panel, przyciski i wybór bufora sprawdzane są przez pełne prostokąty
   w viewporcie i elementFromPoint przed kliknięciem, także przy długim statusie
@@ -134,7 +138,7 @@ main nie ma jeszcze tych zmian; w tej pracy nie uruchomiono wdrożenia.
 - `git diff --check`: PASS.
 
 Chromium używa syntetycznego WAV zamiast prawdziwego MP3 z usługi; import trafia
-lokalnie do TestClient. Nie testowano rzeczywistego edge-tts, Xiaomi, blokady
+lokalnie do TestClient. W tej weryfikacji nie testowano rzeczywistego edge-tts, Xiaomi, blokady
 Androida, sieci mobilnej ani Render. Biblioteki nie aktualizowano. TestClient
 emituje ostrzeżenie o wycofywaniu integracji httpx, które nie blokuje testów.
 
@@ -168,3 +172,11 @@ cyklu po zwolnieniu URL potwierdza trzy próby oraz brak czwartej automatycznej
 próby po porażce. Globalny cooldown nie jest zerowany. Pozostały kod odtwarzacza,
 segmentacja, dostawca i wygląd aplikacji nie wymagają zmian. Kontrola geometrii
 panelu w obu żądanych rozmiarach nie wykazała potrzeby zmiany CSS.
+
+## Domyślny bufor produkcyjny
+
+Po akceptacji testów Xiaomi 14T zgłoszonej przez użytkownika domyślnie włączono
+buffer=2. Zmiana kodu względem 8dd5f2e dotyczy wyłącznie inicjalizacji bufferMode;
+warunek test=1 dla diagnostyki, kolejka, limity, próby i segmentacja pozostały
+bez zmian. Regresje obejmują domyślne przygotowanie dwóch fragmentów bez panelu,
+awaryjne wyłączenie oraz niezależność parametrów test i buffer.

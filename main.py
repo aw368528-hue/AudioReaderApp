@@ -419,7 +419,7 @@ HTML_PAGE = """
     });
 
     const testMode = new URLSearchParams(location.search).get('test') === '1';
-    let bufferMode = testMode && new URLSearchParams(location.search).get('buffer') === '2' ? 2 : 0;
+    let bufferMode = new URLSearchParams(location.search).get('buffer') === '0' ? 0 : 2;
     const CACHE_MAX_FRAGMENTS = 3;
     const CACHE_MAX_BYTES = 8 * 1024 * 1024;
     let jobs = new Map();

@@ -152,9 +152,9 @@ test('Spóźniona odpowiedź i stare zdarzenia nie zmieniają nowej sesji', asyn
     assert.equal(oldPlayer.plays, 0);
     assert.equal(h.run('audio.plays'), 1);
 });
-test('Nie generuje następnego fragmentu przed końcem aktywnego', async () => {
+test('Awaryjne buffer=0 nie generuje następnego fragmentu przed końcem aktywnego', async () => {
     let calls = 0;
-    const h = harness(async () => { calls++; return ok(); });
+    const h = harness(async () => { calls++; return ok(); }, '?buffer=0');
     h.run('sentences = ["Pierwsze.", "Drugie."]; window.startFrom(0)');
     await settle();
     assert.equal(calls, 1);
@@ -210,7 +210,7 @@ test('Kolejne NoAudioReceived: 3 próby z przerwą, wznowienie tego samego fragm
     h.context.fetch = async () => { calls++; return ok(); };
     h.run('window.togglePlay()');
     for (let n = 0; n < 10; n++) await new Promise(r => setTimeout(r, 1));
-    assert.equal(calls, 4);
+    assert.equal(calls, 5); // Resumed current fragment and one prefetched successor.
     assert.equal(h.run('currentIdx'), 0);
     assert.equal(h.delays.at(-1), 10000);
 });
@@ -268,7 +268,7 @@ test('Dwie nieudane próby odtwarzają zdanie raz i przesuwają pozycję raz', a
     const h = harness(async () => ++calls <= 2 ? failed() : ok());
     h.run('sentences = ["Pierwsze.", "Drugie."]; window.startFrom(0)');
     await settle();
-    assert.equal(calls, 3);
+    assert.equal(calls, 4); // Three attempts of current + one prefetched successor.
     assert.equal(h.run('audio.plays'), 1);
     assert.equal(h.run('currentIdx'), 0);
     const ended = h.run('audio.onended');
@@ -414,14 +414,31 @@ test('TXT-02: zwykłe słowa status, data i projekt nie wyznaczają granic',()=>
     assert.deepEqual(segments('Projekt wymaga ustalenia daty i statusu. To pełna wypowiedź.'),
         ['Projekt wymaga ustalenia daty i statusu.','To pełna wypowiedź.']);
 });
-test('Tryb testowy jest świadomy, a buffer=2 bez test=1 jest ignorowany', () => {
-    const normal = harness(async () => ok(), '?buffer=2');
-    assert.equal(normal.run('bufferMode'), 0);
-    assert.equal(normal.run('diagnosticReport()'), null);
-    assert.equal(normal.context.document.body.children.length, 0);
-    const debug = harness(async () => ok(), '?test=1&buffer=2');
-    assert.equal(debug.run('bufferMode'), 2);
-    assert.equal(debug.context.document.body.children.length, 1);
+test('Domyślny bufor i awaryjny przełącznik są niezależne od diagnostyki', () => {
+    for (const [query, buffer, debug] of [
+        ['',2,false], ['?buffer=0',0,false], ['?buffer=2',2,false],
+        ['?test=1&buffer=0',0,true], ['?test=1&buffer=2',2,true],
+        ['?test=1',2,true], ['?test=0',2,false], ['?test=0&buffer=0',0,false],
+        ['?buffer=invalid',2,false], ['?buffer=',2,false]
+    ]) {
+        const h=harness(async()=>ok(),query);
+        assert.equal(h.run('bufferMode'),buffer,query);
+        assert.equal(h.run('diagnosticReport() !== null'),debug,query);
+        assert.equal(h.context.document.body.children.length,debug ? 1 : 0,query);
+    }
+});
+test('Zwykły adres przygotowuje dwa fragmenty bez panelu i bez duplikatów', async () => {
+    const texts=[];
+    const h=harness(async(url, options)=>{texts.push(options.body.get('text'));return ok();});
+    h.run('sentences=["A.","B.","C.","D."]; window.startFrom(0)'); await settle();
+    assert.deepEqual(texts,['A.','B.','C.']);
+    assert.equal(h.run('audio.plays'),1);
+    assert.equal(h.run('diagnosticReport()'),null);
+    assert.equal(h.context.document.body.children.length,0);
+    h.run('audio.onended()'); await settle();
+    assert.deepEqual(texts,['A.','B.','C.','D.']);
+    assert.equal(h.run('audio.plays'),2);
+    h.run('window.stopReading()');
 });
 test('Buffer=2: kolejka sekwencyjna i deduplikacja z promocją aktywnego zadania', async () => {
     const pending = [];
