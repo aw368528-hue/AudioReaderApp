@@ -136,4 +136,36 @@ with sync_playwright() as playwright:
         assert not errors, errors
         print(f'PASS Chromium {fixture}/{mode}/{query or "standard"}: {len(expected)} exact TTS payloads, ordered playback, serial fetch, released URLs', flush=True)
         page.close()
+    # A DOM element can be "visible" yet clipped by body overflow:hidden.
+    # Check full rectangles and hit targets before clicks (which can auto-scroll).
+    for width, height in [(360, 640), (393, 852)]:
+        for buffer in [0, 2]:
+            for tab in ['reader', 'editor']:
+                page = browser.new_page(viewport={'width': width, 'height': height})
+                query = f'?test=1&buffer={buffer}'
+                page.route('**/*', lambda route: route.fulfill(content_type='text/html', body=main.HTML_PAGE)
+                           if route.request.url == 'https://reader.test/' + query else route.abort())
+                page.goto('https://reader.test/' + query)
+                page.evaluate('(tab) => {renderSentences("Test dokumentu. ".repeat(100)); window.switchTab(tab);}', tab)
+                for status in ['Gotowy', 'Oczekiwanie na TTS • przerwa 120 s • próba 3/3 • zdanie 100/100',
+                               'Błąd odtwarzania: Usługa syntezy nie zwróciła audio. Wyczerpano 3 próby. Naciśnij ▶, aby wznowić ten sam fragment po przerwie.']:
+                    page.evaluate('(status) => setStatus(status)', status)
+                    geometry = page.evaluate('''() => {
+                        const ids=['diagnosticBuffer','diagnosticDownload','diagnosticCopy','playBtn'];
+                        const nodes=ids.map(id=>document.getElementById(id));
+                        nodes.push(nodes[1].parentElement.parentElement);
+                        return nodes.map(e=>{const r=e.getBoundingClientRect();return {
+                            id:e.id || 'panel', top:r.top, bottom:r.bottom,
+                            inside:r.top>=0 && r.bottom<=innerHeight && r.left>=0 && r.right<=innerWidth,
+                            hit:e.contains(document.elementFromPoint((r.left+r.right)/2,(r.top+r.bottom)/2))};});
+                    }''')
+                    assert all(item['inside'] and item['hit'] for item in geometry), (width, height, tab, status, geometry)
+                with page.expect_download() as download:
+                    page.locator('#diagnosticDownload').click()
+                report = json.loads(Path(download.value.path()).read_text())
+                assert report['schema'] == 'MOB-03A/1' and report['buffer'] == buffer
+                assert 'Test dokumentu' not in json.dumps(report)
+                assert page.evaluate('window.scrollY') == 0
+                print(f'PASS Chromium panel {width}x{height}/buffer={buffer}/{tab}: geometry, hit targets, JSON download', flush=True)
+                page.close()
     browser.close()

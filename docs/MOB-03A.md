@@ -31,7 +31,7 @@ clearAudioCache oraz dopisywanych testów; zachowano segmentację i jej regresje
 ## Zabezpieczenia MOB-02
 
 Backend /tts, limity czasu i klasyfikacja błędów pozostały bez zmian.
-Frontend zachowuje najwyżej trzy próby na fragment w sesji, wspólny cooldown,
+Frontend zachowuje najwyżej trzy próby na cykl syntezy fragmentu, wspólny cooldown,
 Retry-After w sekundach lub dacie i zakaz automatycznego ponawiania jawnego
 odrzucenia dostawcy. Odstępy bazowe wynoszą 3 i 8 s; no_audio z backendu
 wymaga przynajmniej 10 s. Cooldown przetrwa zatrzymanie i ręczne wznowienie.
@@ -52,8 +52,10 @@ zadania i ich tekstowe referencje. Diagnostyka ma limit 2000 zdarzeń i 2000
 próbek przerw; raport podaje liczbę odrzuconych starszych wpisów.
 
 Gdy bufor nie pomieści przyszłego audio, nie zachowuje go i wstrzymuje prefetch.
-Po zwolnieniu miejsca może być potrzebne ponowne pobranie, nadal w ramach
-wspólnego budżetu. Plik większy niż 8 MiB jest odrzucany z czytelnym komunikatem,
+Po zwolnieniu miejsca może być potrzebne ponowne pobranie. Poprawne audio
+kończy cykl prób także wtedy, gdy nie mieści się w cache; nowa synteza po
+nietrafieniu w cache dostaje nowy budżet. Same błędy ani przekazanie zadania
+z prefetch do odtwarzania nie odnawiają budżetu. Plik większy niż 8 MiB jest odrzucany z czytelnym komunikatem,
 bez automatycznych ponowień. Nie tniemy ani nie usuwamy tekstu.
 Limit dotyczy zachowanych blobów, nie całej pamięci Chrome: w trakcie odbierania
 body występuje dodatkowy blob, dekoder ma własną pamięć, a tekst i DOM dokumentu
@@ -113,9 +115,13 @@ main nie ma jeszcze tych zmian; w tej pracy nie uruchomiono wdrożenia.
 
 ## Weryfikacja lokalna
 
-- 17 testów Python, w tym uruchomione 54 testy JavaScript: PASS.
-- 24 scenariusze Chromium: dwa komplety realistycznych plików TXT/PDF/DOCX
-  i wklejanie ręczne, każdy standardowo oraz buffer=0/2: PASS.
+- 17 testów Python, w tym uruchomione 57 testów JavaScript: PASS.
+- 32 scenariusze Chromium: 24 przebiegi importu/odczytu (dwa komplety
+  TXT/PDF/DOCX i wklejanie ręczne, standardowo oraz buffer=0/2) oraz 8 kontroli
+  panelu (360×640 i 393×852, buffer=0/2, lektor/edytor): PASS.
+  Panel, przyciski i wybór bufora sprawdzane są przez pełne prostokąty
+  w viewporcie i elementFromPoint przed kliknięciem, także przy długim statusie
+  błędu; każdy z 8 przypadków pobiera i odczytuje JSON.
 - Dokładne payloady TTS, brak pominięć/duplikatów w przebiegu bez błędów,
   rzeczywiste zdarzenia playing/ended, kolejność, pojedynczy fetch, limity
   cache, zwolnienie URL i pobranie raportu z panelu: PASS.
@@ -142,3 +148,23 @@ Nie obchodzimy odrzucenia dostawcy. Limit 45 s syntezy dla bardzo długich
 fragmentów pozostaje bez zmian. Chrome może ograniczać JS, timery i fetch w tle;
 nie ma gwarancji ciągłego odczytu po blokadzie ekranu. Nie dodano Media Session,
 nowego dostawcy, bufora MOB-03 poza tym zakresem ani natywnego odtwarzacza.
+
+## Uzupełniający przegląd PR #4
+
+Na bazie 1302bbb odtworzono dwa powiązane problemy licznika prób:
+
+- Sukces w trzeciej próbie, releaseJob i ponowne żądanie w tej samej sesji
+  zwracały poprzedni błąd zamiast rozpocząć nową syntezę. To test cyklu życia
+  cache; nie dowodzi błędu standardowego cofania, które resetuje sesję.
+- W rzeczywistym cyklu odtwarzania nagranie A (7 MiB) blokuje zapis udanego
+  prefetch B (2 MiB). Po końcu A odtwarzacz musi ponownie pobrać B. Dawniej
+  sukces prefetch zajmował jedną próbę i po dwóch błędach nowego pobrania
+  odczyt zatrzymywał się przed trzecią próbą. Test odtwarza ten scenariusz
+  przez startFrom, fillBuffer i onended, bez ręcznego usuwania cache.
+
+Po poprawnym zakończeniu synthesize zerowane są attempts i poprzedni error;
+limit trzech prób nieprzerwanej nieudanej syntezy pozostaje w mocy. Test nowego
+cyklu po zwolnieniu URL potwierdza trzy próby oraz brak czwartej automatycznej
+próby po porażce. Globalny cooldown nie jest zerowany. Pozostały kod odtwarzacza,
+segmentacja, dostawca i wygląd aplikacji nie wymagają zmian. Kontrola geometrii
+panelu w obu żądanych rozmiarach nie wykazała potrzeby zmiany CSS.

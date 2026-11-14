@@ -630,6 +630,10 @@ HTML_PAGE = """
                     try {
                         const stored = await synthesize(job, signal, token);
                         if (token !== session || signal.aborted) throw new DOMException('Anulowano', 'AbortError');
+                        // Valid audio ends this synthesis cycle, even if cache capacity
+                        // prevents retaining it. A later cache miss starts a new budget.
+                        job.attempts = 0;
+                        job.error = null;
                         job.status = stored ? 'done' : 'deferred';
                         if (!stored) prefetchBlocked = true;
                         job.resolve(stored ? job.url : null);

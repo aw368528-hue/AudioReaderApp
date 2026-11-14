@@ -821,6 +821,55 @@ test('Diagnostyka nie rośnie bez ograniczeń i nie zachowuje tekstu błędów H
     assert.equal(report.dropped_gap_samples,100);
     assert.ok(report.dropped_events>0);
 });
+test('Brak miejsca po udanym prefetch nie pomniejsza budżetu późniejszej syntezy', async () => {
+    let b=0;
+    const h=harness(async(url,options)=>{
+        if(options.body.get('text')==='A.')return {ok:true,blob:async()=>({size:7*1024*1024})};
+        b++;
+        return b===2 || b===3 ? failed() : {ok:true,blob:async()=>({size:2*1024*1024})};
+    },'?test=1&buffer=2');
+    h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+    const token=h.run('session');
+    assert.equal(b,1);
+    assert.equal(h.run('prefetchCache.size'),1); // B succeeded but could not fit beside A.
+    h.run('audio.onended()'); await settle();
+    assert.equal(b,4); // Successful discarded prefetch + 3 attempts of the new synthesis.
+    assert.equal(h.run('session'),token);
+    assert.equal(h.run('isReading'),true);
+    assert.equal(h.run('audio.plays'),2);
+    assert.equal(h.run('currentIdx'),1);
+    assert.ok(h.run('cacheBytes()')<=8*1024*1024);
+    h.run('window.stopReading()');
+});
+test('Udana trzecia próba, usunięcie URL i ponowna synteza bez restartu sesji', async () => {
+    let calls=0;
+    const h=harness(async()=>++calls % 3 === 0 ? ok() : failed(), '?test=1&buffer=2');
+    h.run('sentences=["A."]');
+    const token=h.run('session');
+    const first=await h.run('fetchAudioBlob(0)');
+    assert.equal(calls,3);
+    assert.equal(h.run('releaseJob([...jobs.values()][0])'),true);
+    assert.ok(h.revoked.includes(first));
+    assert.equal(h.run('jobs.size'),1);
+    const second=await h.run('fetchAudioBlob(0)');
+    assert.equal(calls,6);
+    assert.notEqual(second,first);
+    assert.equal(h.run('session'),token);
+    h.run('window.stopReading()');
+});
+test('Usunięcie udanego audio nie daje nieskończonych prób po nowym błędzie', async () => {
+    let calls=0;
+    const h=harness(async()=>++calls === 1 ? ok() : failed(), '?test=1&buffer=2');
+    h.run('sentences=["A."]');
+    await h.run('fetchAudioBlob(0)');
+    h.run('releaseJob([...jobs.values()][0])');
+    const token=h.run('session');
+    await assert.rejects(h.run('fetchAudioBlob(0)'),/Wyczerpano 3 próby/);
+    assert.equal(calls,4);
+    await assert.rejects(h.run('fetchAudioBlob(0)'),/Wyczerpano 3 próby/);
+    assert.equal(calls,4);
+    assert.equal(h.run('session'),token);
+});
 (async () => {
     for (const [name, fn] of cases) {
         await fn();
