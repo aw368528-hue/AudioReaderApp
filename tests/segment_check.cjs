@@ -7,7 +7,7 @@ const nodes = new Map();
 const node = () => ({value: '', style: {}, children: [], classList: {add(){}, remove(){}, toggle(){}},
     addEventListener(){}, scrollIntoView(){}, appendChild(child){this.children.push(child);}});
 const sent=[];
-const context=vm.createContext({window:{}, document:{
+const context=vm.createContext({window:{}, location:{search:""}, URLSearchParams, performance, document:{
     getElementById(id){if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);},
     createElement:node, querySelectorAll:()=>[]},
     Audio:class {pause(){} removeAttribute(){} load(){}},
@@ -30,7 +30,7 @@ context.document.getElementById('rateSlider').value='0';
         assert.equal(segments.join(' '),item.text.replace(/\s+/gu,' ').trim(),`${item.name}: lossless content/order`);
         assert.ok(!segments.some(text=>/^\d+\.$/.test(text)),`${item.name}: standalone label`);
         sent.length=0;
-        for(let idx=0;idx<segments.length;idx++)await vm.runInContext(`fetchAudioBlob(${idx})`,context);
+        for(let idx=0;idx<segments.length;idx++)await vm.runInContext(`currentIdx=${idx}; fetchAudioBlob(${idx})`,context);
         assert.deepEqual(sent,item.expected,`${item.name}: exact /tts payloads`);
         console.log(`PASS: ${item.name}, ${segments.length} fragments, exact content and TTS payloads`);
     }
