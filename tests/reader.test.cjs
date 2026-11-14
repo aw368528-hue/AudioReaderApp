@@ -50,7 +50,7 @@ test('Skróty wieloczłonowe i polskie litery', () => {
         ['To m.in. św. Jan i prof. Nowak.', 'Następne zdanie.']);
 });
 test('Ręczne wklejenie, akapity i białe znaki', () => {
-    assert.deepEqual(segments('Pierwszy\nwiersz\n\nDrugi akapit\r\n\r\nTrzeci.'), ['Pierwszy wiersz', 'Drugi akapit', 'Trzeci.']);
+    assert.deepEqual(segments('Pierwszy\nwiersz\n\nDrugi akapit\r\n\r\nTrzeci.'), ['Pierwszy wiersz Drugi akapit Trzeci.']);
     assert.deepEqual(segments(' \n\t\r\n'), []);
     const h = harness(async () => { throw Error('Nie powinno być żądania'); });
     h.context.document.getElementById('rawText').value = 'Pierwsze zdanie. Drugie zdanie.';
@@ -289,6 +289,56 @@ test('Przejście dalej podczas oczekiwania nie przywraca starego zdania', async 
     assert.deepEqual(texts, ['Pierwsze.', 'Drugie.']);
     assert.equal(h.run('currentIdx'), 1);
     assert.equal(h.run('audio.plays'), 1);
+});
+test('TXT-01: rzeczywiste przykłady nie dzielą Risk Engine ani zdania po przecinku', () => {
+    const risk='Wszystkie trzy dokumenty chcą deterministycznego Risk\n\nEngine z prawem veta…';
+    assert.deepEqual(segments(risk), ['Wszystkie trzy dokumenty chcą deterministycznego Risk Engine z prawem veta…']);
+    const percent='20 strategii szumu nie dowodzi «≤5% fałszywych przepuszczeń»,\n\na forward paper 3–6 miesięcy nie może rozstrzygnąć o przewadze…';
+    assert.deepEqual(segments(percent), ['20 strategii szumu nie dowodzi «≤5% fałszywych przepuszczeń», a forward paper 3–6 miesięcy nie może rozstrzygnąć o przewadze…']);
+});
+test('TXT-01: numeracja, śródtytuły i listy bez kropek końcowych', () => {
+    assert.deepEqual(segments('4.\n\nOcena ryzyka\n\nPełna wypowiedź trwa dalej.\n\n5. Kolejny punkt\n6. Następny punkt.'),
+        ['4. Ocena ryzyka Pełna wypowiedź trwa dalej.', '5. Kolejny punkt', '6. Następny punkt.']);
+    assert.deepEqual(segments('Wstęp\n\nPierwsza wypowiedź.\n\nWnioski\n\nDruga wypowiedź.'),
+        ['Wstęp Pierwsza wypowiedź.', 'Wnioski Druga wypowiedź.']);
+    assert.deepEqual(segments('Lista:\n- pierwszy element\n- drugi element\n- trzeci element'),
+        ['Lista: - pierwszy element', '- drugi element', '- trzeci element']);
+});
+test('TXT-01: polska interpunkcja, techniczne oznaczenia i dialog', () => {
+    const text='Dr. A. B. Kowalski pracuje np. na ul. Długiej, tj. w centrum. Wersja v1.2.3 ma próg 3.14%, zakres 3–6 i API/RFC-8259. To (np. wersja testowa; pytanie? nadal ta sama wypowiedź) działa. „Tak!”\n— powiedział autor. Dalej... ale bez końca. Koniec.';
+    assert.deepEqual(segments(text), [
+        'Dr. A. B. Kowalski pracuje np. na ul. Długiej, tj. w centrum.',
+        'Wersja v1.2.3 ma próg 3.14%, zakres 3–6 i API/RFC-8259.',
+        'To (np. wersja testowa; pytanie? nadal ta sama wypowiedź) działa.',
+        '„Tak!” — powiedział autor.', 'Dalej... ale bez końca.', 'Koniec.'
+    ]);
+    assert.deepEqual(segments('To m.in. sp. z o.o. oraz narzędzia itd. Następne zdanie.'),
+        ['To m.in. sp. z o.o. oraz narzędzia itd.', 'Następne zdanie.']);
+});
+test('TXT-01: układ oddzielony od tekstu mówionego, dokładna treść wysłana do TTS', async () => {
+    const h=harness(async (url, options) => { h.sent.push(options.body.get('text')); return ok(); });
+    h.sent=[];
+    const input='Wszystkie trzy dokumenty chcą deterministycznego Risk\n\nEngine z prawem veta,\n\nbez pominięć.';
+    h.run(`renderSentences(${JSON.stringify(input)})`);
+    const spoken='Wszystkie trzy dokumenty chcą deterministycznego Risk Engine z prawem veta, bez pominięć.';
+    assert.deepEqual(Array.from(h.run('sentences')), [spoken]);
+    assert.equal(h.context.document.getElementById('readerView').children[0].innerText, input);
+    h.run('window.startFrom(0)'); await settle();
+    assert.deepEqual(h.sent,[spoken]);
+    assert.deepEqual(spoken.split(/\s+/),input.split(/\s+/));
+});
+test('TXT-01: dokładna kolejność słów, pełne zdania i krótkie uzasadnione odpowiedzi', () => {
+    const input='Pierwsza\n\nwypowiedź, nadal bez kropki.\n\nDruga wypowiedź. Tak. Nie!\n\n4.\n\nDalsza wypowiedź.';
+    const out=segments(input);
+    assert.deepEqual(out,['Pierwsza wypowiedź, nadal bez kropki.','Druga wypowiedź.','Tak.','Nie!','4. Dalsza wypowiedź.']);
+    assert.deepEqual(out.join(' ').split(/\s+/),input.split(/\s+/));
+    assert.ok(!out.some(item=> /^\d+\.$/.test(item)));
+});
+test('TXT-01: numer przepisu po zawinięciu wiersza nie staje się listą', () => {
+    assert.deepEqual(segments('Zgodnie z art.\n4.\nust. 2. wymagamy kontroli. Następne zdanie.'),
+        ['Zgodnie z art. 4. ust. 2. wymagamy kontroli.', 'Następne zdanie.']);
+    assert.deepEqual(segments('Próg to 3. miejsce, nie 4. wynik. Data 14. 11. 2026 r. wymaga kontroli.'),
+        ['Próg to 3. miejsce, nie 4. wynik.', 'Data 14. 11. 2026 r. wymaga kontroli.']);
 });
 (async () => {
     for (const [name, fn] of cases) {
