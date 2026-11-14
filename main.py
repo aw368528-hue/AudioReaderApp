@@ -5,11 +5,29 @@ import os
 import docx
 import edge_tts
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 from pypdf import PdfReader
 import uvicorn
 
 app = FastAPI()
+
+@app.get("/manifest.json")
+async def manifest():
+    return {
+        "name": "AudioReader AI",
+        "short_name": "AudioReader",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#121316",
+        "theme_color": "#121316",
+        "icons": [
+            {
+                "src": "https://cdn-icons-png.flaticon.com/512/3241/3241642.png",
+                "sizes": "512x512",
+                "type": "image/png"
+            }
+        ]
+    }
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -18,6 +36,7 @@ HTML_PAGE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="#121316">
+    <link rel="manifest" href="/manifest.json">
     <title>AudioReader AI</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
