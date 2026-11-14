@@ -16,3 +16,11 @@ rzeczywistych zdarzeń audio w Chromium (z atrapą syntezy WAV):
 
 Wymaga Playwright i /usr/bin/chromium wyłącznie w środowisku developerskim.
 Nie są one nowymi zależnościami aplikacji wdrażanej na Render.
+
+MOB-03A: ten sam zestaw unittest uruchamia też testy pojedynczej kolejki,
+limitów cache, wspólnego budżetu prób i prywatności diagnostyki.
+`browser_segmentation.py` sprawdza obecnie 24 scenariusze: TXT-01/TXT-02,
+cztery drogi importu, tryb standardowy i testowe buffer=0/2. Używa prawdziwych
+zdarzeń odtwarzacza z syntetycznym WAV, sprawdza porządek odtwarzania,
+serializację pobierania, zwalnianie URL i pobranie JSON w mobilnym viewporcie.
+Instrukcja fizycznego telefonu i granice pomiarów: docs/MOB-03A.md.

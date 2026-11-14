@@ -362,13 +362,6 @@ HTML_PAGE = """
         return speechSegments(text).map(segment => segment.text);
     }
 
-    function clearAudioCache() {
-        for (const promise of prefetchCache.values()) {
-            promise.then(url => { if (url) URL.revokeObjectURL(url); }).catch(() => {});
-        }
-        prefetchCache = new Map();
-    }
-
     window.switchTab = function(tab) {
         document.getElementById('readerView').style.display = tab === 'reader' ? 'flex' : 'none';
         document.getElementById('editorView').style.display = tab === 'editor' ? 'flex' : 'none';
@@ -425,6 +418,118 @@ HTML_PAGE = """
         }
     });
 
+    const testMode = new URLSearchParams(location.search).get('test') === '1';
+    let bufferMode = testMode && new URLSearchParams(location.search).get('buffer') === '2' ? 2 : 0;
+    const CACHE_MAX_FRAGMENTS = 3;
+    const CACHE_MAX_BYTES = 8 * 1024 * 1024;
+    let jobs = new Map();
+    let queueRunning = false;
+    let prefetchBlocked = false;
+    let attachedKey = null;
+    let transition = null;
+    const diagnostics = testMode ? {started: performance.now(), events: [], dropped: 0,
+        gaps: [], droppedGaps: 0, failed: 0, cancelled: 0, hits: 0, misses: 0} : null;
+
+    function trace(type, fields = {}) {
+        if (!diagnostics) return;
+        if (diagnostics.events.length === 2000) { diagnostics.events.shift(); diagnostics.dropped++; }
+        diagnostics.events.push({type, ms: performance.now() - diagnostics.started,
+            session, index: currentIdx, buffer: bufferMode,
+            visibility: document.visibilityState || 'unknown', ...fields});
+    }
+
+    function finishTransition(outcome) {
+        if (!transition) return;
+        if (diagnostics) {
+            if (outcome === 'failed') diagnostics.failed++;
+            if (outcome === 'cancelled') diagnostics.cancelled++;
+            if (outcome === 'playing') {
+                const gap = Math.max(0, performance.now() - transition.ended);
+                const visibility = !transition.mixed && transition.visibility === document.visibilityState ? transition.visibility : 'mixed';
+                if (diagnostics.gaps.length === 2000) { diagnostics.gaps.shift(); diagnostics.droppedGaps++; }
+                diagnostics.gaps.push({ms: gap, visibility, buffer: transition.buffer});
+                trace('gap', {gap_ms: gap, from: transition.from, to: transition.to, gap_visibility: visibility});
+            } else trace('transition_' + outcome, {from: transition.from, to: transition.to});
+        }
+        transition = null;
+    }
+
+    function diagnosticReport() {
+        if (!diagnostics) return null;
+        const stats = values => {
+            const sorted = values.slice().sort((a, b) => a - b);
+            const n = sorted.length;
+            return {count: n, median_ms: n ? (sorted[Math.floor((n - 1) / 2)] + sorted[Math.floor(n / 2)]) / 2 : null,
+                p95_ms: n ? sorted[Math.ceil(n * .95) - 1] : null, max_ms: n ? sorted[n - 1] : null};
+        };
+        const groups = {};
+        for (const mode of [0, 2]) for (const visibility of ['visible', 'hidden', 'mixed', 'unknown']) {
+            groups[`buffer=${mode}/${visibility}`] = stats(diagnostics.gaps.filter(g => g.buffer === mode && g.visibility === visibility).map(g => g.ms));
+        }
+        return {schema: 'MOB-03A/1', elapsed_ms: performance.now() - diagnostics.started,
+            buffer: bufferMode, limits: {fragments: CACHE_MAX_FRAGMENTS, bytes: CACHE_MAX_BYTES},
+            gaps: stats(diagnostics.gaps.map(g => g.ms)), groups,
+            failed_transitions: diagnostics.failed, cancelled_transitions: diagnostics.cancelled,
+            pending_transition: transition ? {from: transition.from, to: transition.to, elapsed_ms: performance.now() - transition.ended} : null,
+            buffer_hits: diagnostics.hits, buffer_misses: diagnostics.misses,
+            dropped_events: diagnostics.dropped, dropped_gap_samples: diagnostics.droppedGaps,
+            cache: {fragments: prefetchCache.size, bytes: cacheBytes()},
+            note: 'Hidden nie oznacza jednoznacznie blokady ekranu. Przerwy mierzą callbacki ended/playing; pauzy użytkownika są wyłączone. Statystyki obejmują ostatnie 2000 próbek.',
+            events: diagnostics.events.map(event => ({...event}))};
+    }
+
+    function exportDiagnostics() {
+        const report = diagnosticReport();
+        if (!report) return;
+        const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], {type: 'application/json'}));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'audioreader-diagnostics.json';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }
+
+    function cacheBytes() { return [...prefetchCache.values()].reduce((sum, job) => sum + job.bytes, 0); }
+    function releaseJob(job) {
+        if (job.key === attachedKey) return false;
+        if (job.url) { URL.revokeObjectURL(job.url); trace('cache_release', {fragment: job.idx, bytes: job.bytes}); job.url = null; }
+        prefetchCache.delete(job.key);
+        if (job.status === 'done') job.status = 'deferred';
+        return true;
+    }
+    function trimCache() {
+        for (const job of prefetchCache.values()) {
+            if (job.idx < currentIdx || job.idx > currentIdx + bufferMode) releaseJob(job);
+        }
+        for (const [key, job] of jobs) {
+            if (key !== attachedKey && (job.idx < currentIdx || job.idx > currentIdx + bufferMode) && !['queued', 'running'].includes(job.status)) jobs.delete(key);
+        }
+    }
+    function clearAudioCache() {
+        for (const job of prefetchCache.values()) releaseJob(job);
+        prefetchCache = new Map();
+    }
+    function storeAudio(job, blob) {
+        if (blob.size > CACHE_MAX_BYTES) {
+            const error = new Error('Fragment audio przekracza limit pamięci (8 MiB).');
+            error.retryable = false;
+            throw error;
+        }
+        trimCache();
+        for (const cached of [...prefetchCache.values()].sort((a, b) => b.idx - a.idx)) {
+            if (cacheBytes() + blob.size <= CACHE_MAX_BYTES && prefetchCache.size < CACHE_MAX_FRAGMENTS) break;
+            if (job.foreground || cached.idx > job.idx) releaseJob(cached);
+        }
+        if (cacheBytes() + blob.size > CACHE_MAX_BYTES || prefetchCache.size >= CACHE_MAX_FRAGMENTS) return false;
+        job.bytes = blob.size;
+        job.url = URL.createObjectURL(blob);
+        prefetchCache.set(job.key, job);
+        trace('cache_store', {fragment: job.idx, bytes: job.bytes, cache_bytes: cacheBytes(), cache_fragments: prefetchCache.size});
+        return true;
+    }
+
     function showGenerationStatus() {
         if (!isReading || isPaused) return;
         const seconds = Math.max(0, Math.ceil((ttsNotBefore - Date.now()) / 1000));
@@ -432,94 +537,186 @@ HTML_PAGE = """
             ? `Oczekiwanie na TTS • przerwa ${seconds} s • próba ${ttsAttempt}/3 • zdanie ${currentIdx + 1}/${sentences.length}`
             : `Generowanie AI (${currentIdx + 1}/${sentences.length}) • próba ${ttsAttempt}/3...`);
     }
-
     async function waitForTts(signal) {
         while (ttsNotBefore > Date.now()) {
             if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
             await new Promise((resolve, reject) => {
                 const cancel = () => { clearTimeout(timer); reject(new DOMException('Anulowano', 'AbortError')); };
-                const timer = setTimeout(() => { signal.removeEventListener('abort', cancel); resolve(); }, ttsNotBefore - Date.now());
+                const timer = setTimeout(() => { signal.removeEventListener('abort', cancel); resolve(); }, Math.min(2147483647, ttsNotBefore - Date.now()));
                 signal.addEventListener('abort', cancel, {once: true});
             });
         }
         if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
     }
 
-    async function fetchAudioBlob(idx, signal = controller.signal) {
-        const text = (sentences[idx] || '').trim();
-        if (!text) return null;
-        const voice = document.getElementById('voiceSelect').value;
-        const rate = document.getElementById('rateSlider').value;
-        const key = JSON.stringify([text, voice, rate]);
-        const cache = prefetchCache;
-        if (cache.has(key)) return cache.get(key);
-        const promise = (async () => {
-            for (let attempt = 0; attempt < 3; attempt++) {
-                if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
-                if (signal === controller.signal && isReading) {
-                    ttsAttempt = attempt + 1;
-                    showGenerationStatus();
+    async function synthesize(job, signal, token) {
+        while (job.attempts < 3) {
+            job.waiting = true;
+            if (job.foreground && token === session) { ttsAttempt = job.attempts + 1; showGenerationStatus(); }
+            await waitForTts(signal);
+            job.waiting = false;
+            if (job.foreground && token === session) showGenerationStatus();
+            job.attempts++;
+            let fetchFinished = false;
+            const fetched = fields => {
+                if (fetchFinished) return;
+                fetchFinished = true;
+                trace('fetch_end', {session: token, fragment: job.idx, attempt: job.attempts, ...fields});
+            };
+            try {
+                const formData = new FormData();
+                formData.append('text', job.text);
+                formData.append('voice', job.voice);
+                formData.append('rate', job.rate);
+                trace('fetch_start', {session: token, fragment: job.idx, attempt: job.attempts, prefetch: !job.foreground});
+                const response = await fetch('/tts', {method: 'POST', body: formData, signal});
+                if (signal.aborted || token !== session) throw new DOMException('Anulowano', 'AbortError');
+                if (!response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    fetched({status: response.status});
+                    const message = typeof data.error === 'string' ? data.error :
+                        (response.status < 500 && response.status !== 429 ? 'Nieprawidłowe dane wejściowe TTS.' : 'Błąd komunikacji z serwerem TTS.');
+                    const error = new Error(`${message} (HTTP ${response.status})`);
+                    const codes = ['no_audio', 'timeout', 'connection_rejected', 'connection_refused',
+                        'communication_error', 'invalid_input', 'synthesis_error'];
+                    error.code = codes.includes(data.code) ? data.code : 'http_error';
+                    error.retryable = typeof data.retryable === 'boolean' ? data.retryable : response.status === 429 || response.status >= 500;
+                    const header = response.headers.get('Retry-After');
+                    const seconds = Number(header);
+                    const delay = header && !Number.isFinite(seconds) ? Date.parse(header) - Date.now() : seconds * 1000;
+                    error.retryDelay = Number.isFinite(delay) ? Math.max(0, delay) : 0;
+                    throw error;
                 }
-                await waitForTts(signal);
-                if (signal === controller.signal) showGenerationStatus();
-                try {
-                    const formData = new FormData();
-                    formData.append('text', text);
-                    formData.append('voice', voice);
-                    formData.append('rate', rate);
-                    const response = await fetch('/tts', {method: 'POST', body: formData, signal});
-                    if (!response.ok) {
-                        const data = await response.json().catch(() => ({}));
-                        const message = typeof data.error === 'string' ? data.error :
-                            (response.status < 500 && response.status !== 429 ? 'Nieprawidłowe dane wejściowe TTS.' : 'Błąd komunikacji z serwerem TTS.');
-                        const error = new Error(`${message} (HTTP ${response.status})`);
-                        error.retryable = typeof data.retryable === 'boolean' ? data.retryable :
-                            response.status === 429 || response.status >= 500;
-                        const retryHeader = response.headers.get('Retry-After');
-                        const seconds = Number(retryHeader);
-                        const delay = retryHeader && !Number.isFinite(seconds) ? Date.parse(retryHeader) - Date.now() : seconds * 1000;
-                        error.retryDelay = Number.isFinite(delay) ? Math.max(0, delay) : 0;
-                        throw error;
-                    }
-                    const blob = await response.blob();
-                    if (!blob.size) {
-                        const error = new Error('Usługa TTS nie zwróciła audio.');
-                        error.retryDelay = 10000;
-                        throw error;
-                    }
-                    if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
-                    return URL.createObjectURL(blob);
-                } catch (error) {
-                    if (error.name === 'AbortError' || signal.aborted) throw error;
-                    if (error.retryable !== false || error.retryDelay > 0) {
-                        ttsNotBefore = Math.max(ttsNotBefore, Date.now() + Math.max(error.retryDelay || 0, 3000));
-                    }
-                    if (error.retryable === false || attempt === 2) {
-                        if (error instanceof TypeError) error = new Error('Błąd komunikacji z serwerem TTS. Sprawdź połączenie.');
-                        if (attempt === 2 && error.retryable !== false) error.message += ' Wyczerpano 3 próby.';
-                        throw error;
-                    }
-                    // A single retry owner; retain the cooldown across stop/resume.
-                    ttsNotBefore = Math.max(ttsNotBefore, Date.now() + Math.max(error.retryDelay || 0, attempt === 0 ? 3000 : 8000));
+                const blob = await response.blob();
+                fetched({status: response.status || 200, bytes: blob.size});
+                if (signal.aborted || token !== session) throw new DOMException('Anulowano', 'AbortError');
+                if (!blob.size) { const error = new Error('Usługa TTS nie zwróciła audio.'); error.code = 'no_audio'; error.retryDelay = 10000; throw error; }
+                return storeAudio(job, blob);
+            } catch (error) {
+                fetched({result: signal.aborted || token !== session ? 'aborted' : 'network_error'});
+                if (signal.aborted || token !== session || error.name === 'AbortError') throw error;
+                trace('tts_error', {fragment: job.idx, attempt: job.attempts,
+                    code: error.code || (error instanceof TypeError ? 'communication_error' : 'audio_error'),
+                    retryable: error.retryable !== false});
+                if (error.retryable !== false || error.retryDelay > 0) {
+                    ttsNotBefore = Math.max(ttsNotBefore, Date.now() + Math.max(error.retryDelay || 0, job.attempts === 1 ? 3000 : 8000));
+                    trace('cooldown', {fragment: job.idx, delay_ms: ttsNotBefore - Date.now()});
                 }
+                if (error instanceof TypeError) error = new Error('Błąd komunikacji z serwerem TTS. Sprawdź połączenie.');
+                job.error = error;
+                if (job.attempts === 3 && error.retryable !== false) error.message += ' Wyczerpano 3 próby.';
+                // Speculation never starts its own retry cycle. Foreground inherits the budget.
+                if (!job.foreground || error.retryable === false || job.attempts === 3) throw error;
+            }
+        }
+        throw job.error || new Error('Wyczerpano 3 próby przygotowania fragmentu.');
+    }
+
+    function pumpQueue() {
+        if (queueRunning || ![...jobs.values()].some(job => job.status === 'queued' &&
+            (job.foreground || (isReading && !isPaused && bufferMode === 2 && !prefetchBlocked)))) return;
+        const token = session;
+        const signal = controller.signal;
+        queueRunning = true;
+        (async () => {
+            try {
+                while (!signal.aborted && token === session) {
+                    const available = [...jobs.values()].filter(job => job.status === 'queued' &&
+                        (job.foreground || (isReading && !isPaused && bufferMode === 2 && !prefetchBlocked)));
+                    available.sort((a, b) => Number(b.foreground) - Number(a.foreground) || a.idx - b.idx);
+                    const job = available[0];
+                    if (!job) break;
+                    job.status = 'running';
+                    try {
+                        const stored = await synthesize(job, signal, token);
+                        if (token !== session || signal.aborted) throw new DOMException('Anulowano', 'AbortError');
+                        job.status = stored ? 'done' : 'deferred';
+                        if (!stored) prefetchBlocked = true;
+                        job.resolve(stored ? job.url : null);
+                        if (job.foreground && stored) prefetchBlocked = false;
+                    } catch (error) {
+                        job.status = 'failed'; job.error = error;
+                        job.reject(error);
+                        if (token !== session || signal.aborted) break;
+                        if (!job.foreground) prefetchBlocked = true;
+                    }
+                }
+            } finally {
+                // Keep the lock across session changes until the aborted fetch settles.
+                queueRunning = false;
+                pumpQueue();
             }
         })();
-        cache.set(key, promise);
-        try { return await promise; }
-        catch (error) { if (cache.get(key) === promise) cache.delete(key); throw error; }
+    }
+
+    function fetchAudioBlob(idx, signal = controller.signal, foreground = true) {
+        const text = (sentences[idx] || '').trim();
+        if (!text) return Promise.resolve(null);
+        if (signal.aborted || signal !== controller.signal) return Promise.reject(new DOMException('Anulowano', 'AbortError'));
+        const voice = document.getElementById('voiceSelect').value;
+        const rate = document.getElementById('rateSlider').value;
+        const key = JSON.stringify([idx, voice, rate]);
+        let job = jobs.get(key);
+        const hit = !!(job && job.url);
+        if (diagnostics && foreground) diagnostics[hit ? 'hits' : 'misses']++;
+        trace(hit ? 'buffer_hit' : 'buffer_miss', {fragment: idx, in_flight: !!job && ['queued', 'running'].includes(job.status), prefetch: !foreground});
+        if (hit) return Promise.resolve(job.url);
+        if (job && ['queued', 'running'].includes(job.status)) {
+            job.foreground ||= foreground;
+            if (foreground && job.status === 'running') {
+                ttsAttempt = Math.max(1, job.attempts + Number(!!job.waiting));
+                showGenerationStatus();
+            }
+            pumpQueue();
+            return job.promise;
+        }
+        if (job && (job.attempts >= 3 || job.error?.retryable === false)) return Promise.reject(job.error || new Error('Wyczerpano 3 próby.'));
+        if (!job) { job = {key, idx, voice, rate, text, attempts: 0, url: null, bytes: 0}; jobs.set(key, job); }
+        job.foreground = foreground;
+        job.status = 'queued';
+        job.promise = new Promise((resolve, reject) => { job.resolve = resolve; job.reject = reject; });
+        pumpQueue();
+        return job.promise;
+    }
+
+    function fillBuffer() {
+        if (bufferMode !== 2 || !isReading || isPaused || prefetchBlocked) return;
+        trimCache();
+        // Queue sequentially. A cache/transport failure freezes speculation.
+        const token = session;
+        const from = currentIdx + 1;
+        const through = currentIdx + 2;
+        (async () => {
+            for (let idx = from; idx <= through && idx < sentences.length; idx++) {
+                if (token !== session || !isReading || isPaused || prefetchBlocked) break;
+                try {
+                    if (idx <= currentIdx || idx > currentIdx + bufferMode) continue;
+                    const url = await fetchAudioBlob(idx, controller.signal, false);
+                    if (!url) break;
+                } catch { break; }
+            }
+        })();
     }
 
     function playbackFailed(error, token) {
         if (token !== session) return;
+        trace("playback_error");
+        finishTransition("failed");
         window.stopReading();
         setStatus('Błąd odtwarzania: ' + error.message + ' Naciśnij ▶, aby wznowić ten sam fragment po przerwie.');
     }
 
     async function playReady(token) {
         if (token !== session || !isReading || isPaused || !ready) return;
+        const idx = currentIdx;
         setStatus(`Czytanie zdania ${currentIdx + 1} z ${sentences.length}`);
-        try { await audio.play(); }
+        trace("play_call");
+        try {
+            await audio.play();
+            if (token === session && currentIdx === idx && isReading && !isPaused) fillBuffer();
+        }
         catch (error) {
+            if (token !== session || currentIdx !== idx) return;
             if (token === session && isPaused && error.name === 'AbortError') return;
             playbackFailed(error, token);
         }
@@ -551,17 +748,39 @@ HTML_PAGE = """
             const audioUrl = await fetchAudioBlob(idx);
             if (token !== session || !isReading) return;
             loading = false;
+            if (!audioUrl) throw new Error('Brak miejsca na fragment audio.');
+            attachedKey = null;
             player.src = audioUrl;
+            attachedKey = [...prefetchCache.values()].find(job => job.url === audioUrl)?.key || null;
+            trimCache();
+            let started = false;
+            player.onplaying = () => {
+                if (token !== session || currentIdx !== idx) return;
+                trace('playing');
+                if (!started) { started = true; finishTransition('playing'); }
+            };
+            player.onwaiting = () => { if (token === session && currentIdx === idx) trace('waiting'); };
+            player.onstalled = () => { if (token === session && currentIdx === idx) trace('stalled'); };
             ready = true;
             player.onended = () => {
                 if (token !== session || !isReading || currentIdx !== idx) return;
+                const endedAt = performance.now();
                 player.onended = null;
+                trace('ended');
+                player.removeAttribute('src');
+                player.load();
+                attachedKey = null;
                 ready = false;
+                if (idx + 1 < sentences.length && !isPaused) transition = {ended: endedAt, from: idx, to: idx + 1,
+                    visibility: document.visibilityState || 'unknown', buffer: bufferMode};
                 currentIdx++;
+                trimCache();
                 if (!isPaused) playCurrent();
             };
-            player.onerror = () => playbackFailed(new Error('Nie można odtworzyć otrzymanego audio.'), token);
-            // Generate only the active fragment; no speculative retries in parallel.
+            player.onerror = () => {
+                if (currentIdx === idx) playbackFailed(new Error('Nie można odtworzyć otrzymanego audio.'), token);
+            };
+
             await playReady(token);
         } catch (error) { playbackFailed(error, token); }
     }
@@ -583,6 +802,8 @@ HTML_PAGE = """
             window.startFrom(currentIdx >= sentences.length ? 0 : currentIdx);
         } else if (!isPaused) {
             isPaused = true;
+            finishTransition("cancelled");
+            trace("pause");
             audio.pause();
             document.getElementById('playBtn').innerText = '▶';
             setStatus('Wstrzymano');
@@ -596,6 +817,8 @@ HTML_PAGE = """
     };
 
     window.stopReading = function() {
+        finishTransition('cancelled');
+        trace('stop');
         session++;
         controller.abort();
         controller = new AbortController();
@@ -605,11 +828,20 @@ HTML_PAGE = """
         loading = false;
         audio.onended = null;
         audio.onerror = null;
+        audio.onplaying = null;
+        audio.onwaiting = null;
+        audio.onstalled = null;
         audio.pause();
         audio.removeAttribute('src');
         audio.load();
         audio = new Audio();
+        attachedKey = null;
         clearAudioCache();
+        for (const job of jobs.values()) {
+            if (['queued', 'running'].includes(job.status)) job.reject(new DOMException('Anulowano', 'AbortError'));
+        }
+        jobs = new Map();
+        prefetchBlocked = false;
         document.getElementById('playBtn').innerText = '▶';
         setStatus('Zatrzymano');
     };
@@ -619,6 +851,46 @@ HTML_PAGE = """
         const next = Math.max(0, Math.min(sentences.length - 1, currentIdx + delta));
         window.startFrom(next);
     };
+
+    function settingsChanged() {
+        const reading = isReading;
+        const paused = isPaused;
+        if (reading) {
+            window.startFrom(currentIdx);
+            if (paused) window.togglePlay();
+        } else window.stopReading();
+    }
+    document.getElementById('voiceSelect').addEventListener('change', settingsChanged);
+    document.getElementById('rateSlider').addEventListener('change', settingsChanged);
+
+    if (testMode) {
+        document.addEventListener('visibilitychange', () => {
+            if (transition) transition.mixed = true;
+            trace('visibility');
+        });
+        const panel = document.createElement('div');
+        panel.className = 'player-card';
+        panel.style.flexShrink = '0';
+        panel.innerHTML = '<div>Test MOB-03A • raport lokalny, bez tekstu dokumentu</div><label>Bufor <select id="diagnosticBuffer"><option value="0">0 — bez prefetch</option><option value="2">2 — dwa fragmenty</option></select></label><div><button class="btn-tonal" id="diagnosticDownload">Pobierz raport JSON</button><button class="btn-tonal" id="diagnosticCopy">Kopiuj raport</button></div><small id="diagnosticResult">Hidden nie oznacza jednoznacznie blokady ekranu.</small>';
+        document.body.appendChild(panel);
+        document.getElementById('diagnosticBuffer').value = String(bufferMode);
+        document.getElementById('diagnosticBuffer').addEventListener('change', event => {
+            window.stopReading();
+            bufferMode = event.target.value === '2' ? 2 : 0;
+            trace('buffer_mode');
+            setStatus('Zmieniono tryb bufora. Naciśnij ▶, aby wznowić bieżący fragment.');
+        });
+        document.getElementById('diagnosticDownload').addEventListener('click', exportDiagnostics);
+        document.getElementById('diagnosticCopy').addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(JSON.stringify(diagnosticReport(), null, 2));
+                document.getElementById('diagnosticResult').innerText = 'Skopiowano raport.';
+            } catch {
+                document.getElementById('diagnosticResult').innerText = 'Kopiowanie niedostępne. Użyj Pobierz raport JSON.';
+            }
+        });
+        trace('test_start');
+    }
 
     function setStatus(msg) {
         document.getElementById('statusText').innerText = msg;
