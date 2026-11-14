@@ -240,6 +240,36 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(response.headers['retry-after'], '8')
         self.assertFalse(Path(paths[0]).exists())
 
+    def test_txt02_exact_metadata_across_import_formats(self):
+        root = Path(__file__).parent / 'fixtures'
+        expected = json.loads((root / 'metadata_document.expected.json').read_text())
+        original = (root / 'metadata_document.txt').read_text()
+        cases = [{'name': 'TXT-02 manual exact example', 'text': original, 'expected': expected},
+                 {'name': 'TXT-02 one extracted line', 'text': ' '.join(original.split()), 'expected': expected}]
+        for suffix in ['txt', 'pdf', 'docx']:
+            data = self.client.post('/upload', files={'file': ('metadata.' + suffix,
+                   (root / ('metadata_document.' + suffix)).read_bytes())}).json()
+            self.assertNotIn('error', data)
+            self.assertEqual(data['text'].split(), original.split(), suffix)
+            if suffix == 'docx':
+                self.assertEqual(data['blocks'][0]['kind'], 'heading')
+            if suffix == 'pdf':
+                # This fixture's physical PDF rows are joined during extraction.
+                self.assertNotIn('\n', data['text'])
+            cases.append({'name': 'TXT-02 ' + suffix, **data, 'expected': expected})
+        self.check_segment_cases(cases)
+
+    def test_txt02_docx_heading_hint_with_inline_metadata(self):
+        import docx
+        doc = docx.Document()
+        doc.add_heading('Raport kwartalny Data: 22 października 2026 r.', level=0)
+        doc.add_paragraph('Autor: Zespół Status: Do weryfikacji')
+        output = io.BytesIO()
+        doc.save(output)
+        data = self.client.post('/upload', files={'file': ('metadata.docx', output.getvalue())}).json()
+        self.check_segment_cases([{'name': 'TXT-02 semantic mixed-case title', **data, 'expected': [
+            'Raport kwartalny', 'Data: 22 października 2026 r.', 'Autor: Zespół', 'Status: Do weryfikacji']}])
+
     def test_frontend(self):
         # Test the actual JavaScript returned by FastAPI, after Python escaping.
         script = self.client.get('/').text.split('<script>')[1].split('</script>')[0]

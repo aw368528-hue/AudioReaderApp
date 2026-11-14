@@ -16,7 +16,6 @@ from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 
 root = Path(__file__).parent / 'fixtures'
-expected = json.loads((root / 'wrapped_document.expected.json').read_text())
 wave_output = io.BytesIO()
 with wave.open(wave_output, 'wb') as audio:
     audio.setnchannels(1)
@@ -27,7 +26,9 @@ client = TestClient(main.app)
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(executable_path='/usr/bin/chromium', args=['--no-sandbox'])
-    for mode in ['manual', 'txt', 'pdf', 'docx']:
+    for fixture, mode in [(fixture, mode) for fixture in ['wrapped_document', 'metadata_document']
+                           for mode in ['manual', 'txt', 'pdf', 'docx']]:
+        expected = json.loads((root / (fixture + '.expected.json')).read_text())
         page = browser.new_page(viewport={'width': 393, 'height': 852})
         sent = []
         errors = []
@@ -49,7 +50,7 @@ with sync_playwright() as playwright:
                     # Chromium interception can omit file bytes from post_data_buffer.
                     # Use the same synthetic fixture for the local API import.
                     filename = part.get_filename()
-                    assert filename == 'wrapped_document.' + mode
+                    assert filename == fixture + '.' + mode
                     response = client.post('/upload', files={'file': (filename, (root / filename).read_bytes())})
                     route.fulfill(status=response.status_code, content_type='application/json', body=response.text)
                 else:
@@ -62,12 +63,12 @@ with sync_playwright() as playwright:
         page.goto('https://reader.test/')
         if mode == 'manual':
             page.evaluate("window.switchTab('editor')")
-            page.locator('#rawText').fill((root / 'wrapped_document.txt').read_text())
+            page.locator('#rawText').fill((root / (fixture + '.txt')).read_text())
             page.locator('.apply-btn').click()
         else:
-            page.locator('#fileInput').set_input_files(str(root / ('wrapped_document.' + mode)))
+            page.locator('#fileInput').set_input_files(str(root / (fixture + '.' + mode)))
         try:
-            page.wait_for_function('sentences.length === 7', timeout=5000)
+            page.wait_for_function('(count) => sentences.length === count', arg=len(expected), timeout=5000)
         except Exception:
             print('DEBUG', mode, page.evaluate('({sentences, raw: document.getElementById("rawText").value, status: document.getElementById("statusText").innerText})'), errors, flush=True)
             raise
@@ -78,6 +79,6 @@ with sync_playwright() as playwright:
         page.wait_for_function("document.getElementById('statusText').innerText === 'Zakończono czytanie'", timeout=20000)
         assert sent == expected, (mode, sent)
         assert not errors, errors
-        print(f'PASS Chromium {mode}: 7 exact TTS payloads, real ended events, no JS errors', flush=True)
+        print(f'PASS Chromium {fixture}/{mode}: {len(expected)} exact TTS payloads, real ended events, no JS errors', flush=True)
         page.close()
     browser.close()

@@ -199,28 +199,91 @@ HTML_PAGE = """
             .replace(/ *\\n */g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
     }
 
-    function readingGroups(text, hints = []) {
-        const lines = text.replace(/\\r\\n?/g, '\\n').split('\\n');
-        const groups = [];
+    function documentUnits(text, hints) {
+        const source = text.replace(/\\r\\n?/g, '\\n');
+        const units = [];
         let offset = 0;
+        let scanned = 0;
+        let depth = 0;
+        let quote = null;
+        let hintIndex = 0;
+        const outside = end => {
+            for (; scanned < end; scanned++) {
+                const char = source[scanned];
+                if (quote) { if (char === quote) quote = null; continue; }
+                if (char === '„') quote = '”';
+                else if (char === '«') quote = '»';
+                else if (char === '"') quote = '"';
+                else if ('([{'.includes(char)) depth++;
+                else if (')]}'.includes(char)) depth = Math.max(0, depth - 1);
+            }
+            return depth === 0 && quote === null;
+        };
+        for (const raw of source.split('\\n')) {
+            while (hintIndex < hints.length && hints[hintIndex].end <= offset) hintIndex++;
+            const hint = hints[hintIndex] && offset >= hints[hintIndex].start ? hints[hintIndex] : null;
+            const labels = /(?<![\\p{L}\\p{N}])(?:Data(?:\\s+(?:utworzenia|modyfikacji|aktualizacji))?|Uczestnicy(?:\\s+konfrontacji)?|Status|Autor(?:zy)?|Wersja|Temat|Projekt|Tytuł|Numer\\s+dokumentu)\\s*:/giu;
+            const matches = [...raw.matchAll(labels)].filter(match => outside(offset + match.index));
+            const first = matches[0];
+            const prefix = first ? raw.slice(0, first.index).trim() : '';
+            const capitals = /\\p{Lu}/u.test(prefix) && !/\\p{Ll}/u.test(prefix);
+            // Inline labels are structural only after an unambiguous title or a
+            // field at line start. Ordinary prose mentioning "Status:" is unchanged.
+            const structural = first && (!prefix || capitals || hint?.kind === 'heading');
+            if (structural) {
+                if (prefix) units.push({raw: raw.slice(0, first.index), start: offset, kind: 'metadata-title'});
+                for (let index = 0; index < matches.length; index++) {
+                    const begin = matches[index].index;
+                    const end = index + 1 < matches.length ? matches[index + 1].index : raw.length;
+                    units.push({raw: raw.slice(begin, end), start: offset + begin, kind: 'metadata'});
+                }
+            } else units.push({raw, start: offset, kind: 'text'});
+            offset += raw.length + 1;
+        }
+        return units;
+    }
+
+    function readingGroups(text, hints = []) {
+        const units = documentUnits(text, hints);
+        const groups = [];
         let current = '';
         let hasBody = false;
         let protectedPrefix = 0;
+        let atomic = false;
         let previous = '';
         let blank = false;
         let hintIndex = 0;
         const flush = () => {
-            if (current.trim()) groups.push({layout: normalizeLayout(current), protectedPrefix});
-            current = ''; hasBody = false; protectedPrefix = 0;
+            if (current.trim()) groups.push({layout: normalizeLayout(current), protectedPrefix, atomic});
+            current = ''; hasBody = false; protectedPrefix = 0; atomic = false;
         };
-        for (const raw of lines) {
-            const start = offset;
-            offset += raw.length + 1;
+        for (const unit of units) {
+            const {raw, start} = unit;
             const line = raw.replace(/[^\\S\\n]+/gu, ' ').trim();
             if (!line) { if (current) current += '\\n\\n'; blank = true; continue; }
             while (hintIndex < hints.length && hints[hintIndex].end <= start) hintIndex++;
             const hint = hints[hintIndex] && start >= hints[hintIndex].start ? hints[hintIndex] : null;
+            if (unit.kind !== 'text') {
+                flush();
+                current = line;
+                atomic = true;
+                hasBody = true;
+                previous = line;
+                blank = false;
+                continue;
+            }
             const marker = /^(?:\\d+(?:\\.\\d+)*[.)]|[a-ząćęłńóśźż][.)]|[IVXLCDM]+[.)]|[•●▪–—-])(?:\\s+|$)/u.exec(line);
+            if (atomic) {
+                // Keep wrapped values, but never absorb a following heading/list.
+                const continuation = (/[,;]$/u.test(previous) || /^\\p{Ll}/u.test(line)) &&
+                    !marker && hint?.kind !== 'heading' && hint?.kind !== 'list';
+                if (continuation) {
+                    current += (blank ? '\\n\\n' : '\\n') + line;
+                    previous = line; blank = false;
+                    continue;
+                }
+                flush();
+            }
             const markerOnly = !!marker && line === marker[0].trim();
             const explicitHeading = hint?.kind === 'heading' || /^#{1,6}\\s/u.test(line);
             // A short capitalized block is only a heading after a completed utterance,
@@ -250,6 +313,10 @@ HTML_PAGE = """
         const contextualAbbreviation = /(?<![\\p{L}\\p{N}])(?:itd|itp|r|w)\\.$/iu;
         for (const group of readingGroups(text, hints)) {
             const source = group.layout;
+            if (group.atomic) {
+                result.push({text: source.replace(/\\s+/gu, ' '), displayText: source});
+                continue;
+            }
             let start = 0;
             let balance = 0;
             let balanceCursor = 0;
