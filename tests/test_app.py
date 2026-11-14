@@ -1,4 +1,6 @@
 import io
+import asyncio
+import json
 import logging
 from pathlib import Path
 import subprocess
@@ -140,6 +142,103 @@ class ReaderTests(unittest.TestCase):
             self.assertNotIn('secret', ''.join(logs.output))
             if code == 'connection_rejected':
                 self.assertEqual(response.headers['retry-after'], '120')
+
+    def check_segment_cases(self, cases):
+        script = self.client.get('/').text.split('<script>')[1].split('</script>')[0]
+        result = subprocess.run(['node', 'tests/segment_check.cjs'],
+                                input=json.dumps({'script': script, 'cases': cases}),
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        print(result.stdout.strip())
+
+    def test_realistic_files_and_manual_text_exact_speech(self):
+        root = Path(__file__).parent / 'fixtures'
+        expected = json.loads((root / 'wrapped_document.expected.json').read_text())
+        original = (root / 'wrapped_document.txt').read_text()
+        cases = [{'name': 'manual', 'text': original, 'expected': expected}]
+        for suffix in ['txt', 'pdf', 'docx']:
+            response = self.client.post('/upload', files={'file': ('sample.' + suffix,
+                                       (root / ('wrapped_document.' + suffix)).read_bytes())})
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn('error', response.json())
+            data = response.json()
+            # Verify extraction has not already lost, repeated or reordered words.
+            self.assertEqual(data['text'].split(), original.split(), suffix)
+            cases.append({'name': suffix, **data, 'expected': expected})
+        self.check_segment_cases(cases)
+        received = []
+        async def save(path):
+            Path(path).write_bytes(b'test-audio')
+        with patch.object(main.edge_tts, 'Communicate') as communicate:
+            def create(text, *args, **kwargs):
+                received.append(text)
+                result = AsyncMock()
+                result.save = save
+                return result
+            communicate.side_effect = create
+            for fragment in expected:
+                self.assertEqual(self.client.post('/tts', data={'text': fragment, 'voice': 'pl-PL-ZofiaNeural'}).status_code, 200)
+        self.assertEqual(received, expected)
+
+    def test_docx_semantic_lists_wrapped_lines_and_unicode_offsets(self):
+        import docx
+        doc = docx.Document()
+        doc.add_paragraph('Tekst z emoji 🚀 trwa dalej.')
+        doc.add_heading('Ocena ryzyka', level=1)
+        doc.add_paragraph('Pierwsza lista z Risk\nEngine i kontrolą.', style='List Number')
+        doc.add_paragraph('Druga pozycja bez kropki', style='List Number')
+        output = io.BytesIO()
+        doc.save(output)
+        data = self.client.post('/upload', files={'file': ('sample.docx', output.getvalue())}).json()
+        self.assertEqual([block['kind'] for block in data['blocks']], ['body','heading','list','list'])
+        self.check_segment_cases([{'name': 'semantic DOCX', **data, 'expected': [
+            'Tekst z emoji 🚀 trwa dalej.',
+            'Ocena ryzyka Pierwsza lista z Risk Engine i kontrolą.',
+            'Druga pozycja bez kropki']}])
+
+    def test_txt_encoding_no_silent_content_loss(self):
+        text = 'Zażółć gęślą jaźń.\n\nRisk Engine działa.'
+        for content in [text.encode('utf-8'), text.encode('utf-8-sig')]:
+            response = self.client.post('/upload', files={'file': ('sample.txt', content)})
+            self.assertEqual(response.json()['text'], text)
+        response = self.client.post('/upload', files={'file': ('sample.txt', text.encode('cp1250'))})
+        self.assertIn('error', response.json())
+        self.assertNotIn('text', response.json())
+
+    def test_long_unpunctuated_fragment_and_45_second_timeout(self):
+        # A formatting break must not introduce arbitrary cuts or content loss.
+        text = ('Bardzo długa wypowiedź bez interpunkcji i bez pomijania treści ' * 2000).strip()
+        boundary = text.rfind(' ', 0, len(text)//2)
+        formatted = text[:boundary] + '\n\n' + text[boundary+1:]
+        expected = text
+        self.check_segment_cases([{'name': 'long unpunctuated (120k chars)',
+                                  'text': formatted, 'expected': [expected]}])
+        original_wait_for = asyncio.wait_for
+        timeouts = []
+        cancelled = []
+        paths = []
+        async def accelerated_wait_for(awaitable, timeout):
+            timeouts.append(timeout)
+            return await original_wait_for(awaitable, timeout=0.01)
+        async def slow_save(path):
+            paths.append(path)
+            try:
+                await asyncio.sleep(5)
+            finally:
+                cancelled.append(True)
+        with patch.object(main.edge_tts, 'Communicate') as communicate, \
+                patch.object(main.asyncio, 'wait_for', side_effect=accelerated_wait_for), \
+                self.assertLogs('uvicorn.error.tts'):
+            communicate.return_value.save = slow_save
+            response = self.client.post('/tts', data={'text': expected, 'voice': 'pl-PL-ZofiaNeural'})
+            self.assertEqual(communicate.call_args.args[0], expected)
+        self.assertEqual(timeouts, [45])
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.json()['code'], 'timeout')
+        self.assertTrue(response.json()['retryable'])
+        self.assertEqual(response.headers['retry-after'], '8')
+        self.assertFalse(Path(paths[0]).exists())
 
     def test_frontend(self):
         # Test the actual JavaScript returned by FastAPI, after Python escaping.

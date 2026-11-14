@@ -193,24 +193,106 @@ HTML_PAGE = """
     let ttsNotBefore = 0;
     let ttsAttempt = 1;
 
-    function splitSentences(text) {
-        const abbreviations = /(?:(?<![\\p{L}\\p{N}])(?:np|itd|itp|tj|tzn|tzw|dr|mgr|prof|inż|ul|al|im|nr|godz|r|str|ust|art|pkt|św|śp|ok|zob|por|ds|wg|m\\.in)|(?<![\\p{L}\\p{N}])[A-ZĄĆĘŁŃÓŚŹŻ])\\.$/iu;
+    // Layout whitespace is retained for display; only the speech projection collapses it.
+    function normalizeLayout(text) {
+        return text.replace(/\\r\\n?/g, '\\n').replace(/[^\\S\\n]+/gu, ' ')
+            .replace(/ *\\n */g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+    }
+
+    function readingGroups(text, hints = []) {
+        const lines = text.replace(/\\r\\n?/g, '\\n').split('\\n');
+        const groups = [];
+        let offset = 0;
+        let current = '';
+        let hasBody = false;
+        let protectedPrefix = 0;
+        let previous = '';
+        let blank = false;
+        let hintIndex = 0;
+        const flush = () => {
+            if (current.trim()) groups.push({layout: normalizeLayout(current), protectedPrefix});
+            current = ''; hasBody = false; protectedPrefix = 0;
+        };
+        for (const raw of lines) {
+            const start = offset;
+            offset += raw.length + 1;
+            const line = raw.replace(/[^\\S\\n]+/gu, ' ').trim();
+            if (!line) { if (current) current += '\\n\\n'; blank = true; continue; }
+            while (hintIndex < hints.length && hints[hintIndex].end <= start) hintIndex++;
+            const hint = hints[hintIndex] && start >= hints[hintIndex].start ? hints[hintIndex] : null;
+            const marker = /^(?:\\d+(?:\\.\\d+)*[.)]|[a-ząćęłńóśźż][.)]|[IVXLCDM]+[.)]|[•●▪–—-])(?:\\s+|$)/u.exec(line);
+            const markerOnly = !!marker && line === marker[0].trim();
+            const explicitHeading = hint?.kind === 'heading' || /^#{1,6}\\s/u.test(line);
+            // A short capitalized block is only a heading after a completed utterance,
+            // or at the document start. Never infer one inside an unfinished sentence.
+            const titleShape = /^[\\p{Lu}\\d]/u.test(line) && line.length <= 80 && line.split(/\\s+/).length <= 8 && !/[.!?…,;]$/u.test(line);
+            const inferredHeading = (blank || !previous) && titleShape && (!previous || /[.!?…][”’»"')\\]]*$/u.test(previous));
+            const heading = explicitHeading || (!marker && inferredHeading);
+            const reportingClause = /^[–—-]\\s+\\p{Ll}/u.test(line) && /[.!?…][”»"']$/u.test(previous);
+            const referenceContinuation = !!marker && /^(?:\\d)/u.test(line) && /(?:\\b(?:art|ust|pkt|nr|rozdz)\\.?|§)\\s*$/iu.test(previous);
+            const list = (!!marker && !reportingClause && !referenceContinuation) || (hint?.kind === 'list' && start === hint.start);
+            if ((heading || list) && hasBody) flush();
+            if (current && !current.endsWith('\\n')) current += '\\n';
+            current += line;
+            if (heading || markerOnly) {
+                protectedPrefix = normalizeLayout(current).length;
+            } else hasBody = true;
+            previous = line;
+            blank = false;
+        }
+        flush();
+        return groups;
+    }
+
+    function speechSegments(text, hints = []) {
         const result = [];
-        for (const paragraph of text.replace(/\\r\\n?/g, '\\n').split(/\\n\\s*\\n/)) {
-            const normalized = paragraph.replace(/\\s+/g, ' ').trim();
+        const alwaysAbbreviation = /(?<![\\p{L}\\p{N}])(?:np|tj|tzn|tzw|dr|mgr|prof|inż|ul|al|im|nr|godz|str|ust|art|pkt|św|śp|ok|zob|por|ds|wg|mln|mld|tys|proc|poz|rys|tab|wyd|ang|łac|ww|m\\.in|p\\.n\\.e|n\\.e|sp|z\\s+o\\.o)\\.$/iu;
+        const contextualAbbreviation = /(?<![\\p{L}\\p{N}])(?:itd|itp|r|w)\\.$/iu;
+        for (const group of readingGroups(text, hints)) {
+            const source = group.layout;
             let start = 0;
-            const boundaries = /[.!?]+[”’»"')\\]]*(?=\\s|$)/gu;
-            for (const match of normalized.matchAll(boundaries)) {
-                const end = match.index + match[0].length;
-                const candidate = normalized.slice(start, end);
-                if (match[0] === '.' && abbreviations.test(candidate)) continue;
-                if (candidate.trim()) result.push(candidate.trim());
+            let balance = 0;
+            let balanceCursor = 0;
+            const boundaries = /[.!?…]+[”’»"')\\]]*(?=\\s|$)/gu;
+            const append = end => {
+                const displayText = source.slice(start, end).trim();
+                if (displayText) result.push({text: displayText.replace(/\\s+/gu, ' '), displayText});
                 start = end;
+            };
+            for (const match of source.matchAll(boundaries)) {
+                const end = match.index + match[0].length;
+                const prefix = source.slice(Math.max(0, end - 160), end);
+                for (const char of source.slice(balanceCursor, end)) {
+                    if ('(['.includes(char)) balance++;
+                    if (')]'.includes(char)) balance--;
+                }
+                balanceCursor = end;
+                const tail = source.slice(end).trimStart();
+                if (end <= group.protectedPrefix && tail) continue;
+                const candidate = source.slice(start, end).trim();
+                const point = match[0] === '.';
+                if (point && tail) {
+                    if (alwaysAbbreviation.test(prefix)) continue;
+                    if (contextualAbbreviation.test(prefix) && !/^[„«"'([]*\\p{Lu}/u.test(tail)) continue;
+                    if (/(?<!\\p{L})[A-ZĄĆĘŁŃÓŚŹŻ]\\.$/u.test(prefix)) continue;
+                    if (/\\d\\.$/u.test(prefix) && /^(?:\\p{Ll}|\\d)/u.test(tail)) continue;
+                    // A list label belongs to its item, including labels on a separate line.
+                    if (/^(?:\\d+(?:\\.\\d+)*|[a-ząćęłńóśźż]|[IVXLCDM]+)\\.$/u.test(candidate)) continue;
+                    if (/(?:\\b(?:art|ust|pkt|nr|rozdz)\\.|§)\\s*\\d+\\.$/iu.test(prefix)) continue;
+                }
+                if (tail && balance > 0) continue;
+                if (tail && /^[—–-]\\s*\\p{Ll}/u.test(tail)) continue;
+                if (tail && /[)\\]]$/u.test(match[0]) && /^\\p{Ll}/u.test(tail)) continue;
+                if (tail && /(?:\\.{2,}|…)/u.test(match[0]) && /^\\p{Ll}/u.test(tail)) continue;
+                append(end);
             }
-            const tail = normalized.slice(start).trim();
-            if (tail) result.push(tail);
+            append(source.length);
         }
         return result;
+    }
+
+    function splitSentences(text) {
+        return speechSegments(text).map(segment => segment.text);
     }
 
     function clearAudioCache() {
@@ -233,17 +315,18 @@ HTML_PAGE = """
         window.switchTab('reader');
     };
 
-    function renderSentences(text) {
+    function renderSentences(text, hints = []) {
         window.stopReading();
         const box = document.getElementById('readerView');
         box.innerHTML = '';
-        sentences = splitSentences(text);
+        const segments = speechSegments(text, hints);
+        sentences = segments.map(segment => segment.text);
 
         sentences.forEach((s, idx) => {
             const div = document.createElement('div');
             div.className = 'sentence';
             div.id = 'sent-' + idx;
-            div.innerText = s;
+            div.innerText = segments[idx].displayText;
             div.onclick = () => window.startFrom(idx);
             box.appendChild(div);
         });
@@ -266,7 +349,7 @@ HTML_PAGE = """
             if (data.error) throw new Error(data.error);
 
             document.getElementById('rawText').value = data.text;
-            renderSentences(data.text);
+            renderSentences(data.text, data.blocks || []);
             window.switchTab('reader');
             setStatus(`✔️ Wczytano plik: ${file.name}`);
         } catch (err) {
@@ -488,7 +571,7 @@ def normalize_pdf_text(text: str) -> str:
     current = ""
     previous_indent = None
     for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = re.sub(r"[ \t]+", " ", raw).strip()
+        line = re.sub(r"[^\S\n]+", " ", raw).strip()
         if not line:
             if current:
                 paragraphs.append(current)
@@ -515,10 +598,27 @@ async def upload_file(file: UploadFile = File(...)):
         name = file.filename.lower()
         extracted = ""
         if name.endswith(".txt"):
-            extracted = content.decode("utf-8", errors="ignore")
+            try:
+                extracted = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                return {"error": "Nie można bezpiecznie odczytać kodowania TXT. Zapisz plik jako UTF-8 i wczytaj ponownie."}
         elif name.endswith(".docx"):
             doc = docx.Document(io.BytesIO(content))
-            extracted = "\n\n".join([p.text for p in doc.paragraphs])
+            parts = []
+            blocks = []
+            offset = 0
+            for paragraph in doc.paragraphs:
+                value = paragraph.text
+                style = paragraph.style.style_id if paragraph.style else ""
+                kind = "heading" if style.startswith(("Heading", "Title", "Subtitle")) else "body"
+                if kind == "body" and (style.startswith("List") or paragraph._p.xpath("./w:pPr/w:numPr")):
+                    kind = "list"
+                length = len(value.encode("utf-16-le")) // 2
+                blocks.append({"start": offset, "end": offset + length, "kind": kind})
+                parts.append(value)
+                offset += length + 2
+            extracted = "\n\n".join(parts)
+            return {"text": extracted, "blocks": blocks}
         elif name.endswith(".pdf"):
             reader = PdfReader(io.BytesIO(content))
             extracted = "\n\n".join(
