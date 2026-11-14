@@ -340,6 +340,68 @@ test('TXT-01: numer przepisu po zawinięciu wiersza nie staje się listą', () =
     assert.deepEqual(segments('Próg to 3. miejsce, nie 4. wynik. Data 14. 11. 2026 r. wymaga kontroli.'),
         ['Próg to 3. miejsce, nie 4. wynik.', 'Data 14. 11. 2026 r. wymaga kontroli.']);
 });
+test('TXT-02: dokładny przykład użytkownika i wszystkie pola w jednym wierszu', async () => {
+    const expected=JSON.parse(fs.readFileSync('tests/fixtures/metadata_document.expected.json','utf8'));
+    const original=fs.readFileSync('tests/fixtures/metadata_document.txt','utf8');
+    assert.deepEqual(segments(original),expected);
+    assert.deepEqual(segments(original.replace(/\s+/gu,' ')),expected);
+    assert.deepEqual(segments(expected.join('\n\n')),expected);
+    const captured=[];
+    const h=harness(async(url, options)=>{captured.push(options.body.get('text'));return ok();});
+    h.run(`renderSentences(${JSON.stringify(original)})`);
+    const visible=h.context.document.getElementById('readerView').children.map(node=>node.innerText.replace(/\s+/gu,' ').trim());
+    assert.deepEqual(visible,expected);
+    for(let idx=0;idx<expected.length;idx++)await h.run(`fetchAudioBlob(${idx})`);
+    assert.deepEqual(captured,expected);
+    assert.equal(captured.join(' '),original.replace(/\s+/gu,' '));
+    assert.ok(!captured[0].endsWith('.'));
+    assert.ok(!captured[3].endsWith('.'));
+});
+test('TXT-02: nie rozdziela każdego dwukropka ani etykiet w zwykłej narracji',()=>{
+    const cases=[
+        'Wyjaśnienie: wybieramy Risk Engine, a nie inny moduł.',
+        'Autor wyjaśnia: Status: gotowy, Data: nie została potwierdzona.',
+        'Status: Warunek: A > B; wynik: bez wdrożeń',
+        'Status: Raport opisuje „Data: 22 października” i termin „Autor: zespół”.',
+        'Analiza zawiera zapis «Status: wstępny», ale to zwykła wypowiedź.'
+    ];
+    for(const text of cases)assert.deepEqual(segments(text),[text]);
+    assert.deepEqual(segments('Uczestnicy: OpenAI (Status: test), Google (Gemini) Status: gotowe'),
+        ['Uczestnicy: OpenAI (Status: test), Google (Gemini)','Status: gotowe']);
+});
+test('TXT-02: typowe etykiety, zachowane wartości i zawijanie metadanych',()=>{
+    assert.deepEqual(segments('Autor: Zespół Data utworzenia: 2026-10-22 Wersja: 2.1 Status: Do weryfikacji'),
+        ['Autor: Zespół','Data utworzenia: 2026-10-22','Wersja: 2.1','Status: Do weryfikacji']);
+    assert.deepEqual(segments('Uczestnicy: OpenAI,\nAnthropic,\nGoogle\nStatus: Raport i rewizja\n\narchitektoniczna; bez wdrożeń'),
+        ['Uczestnicy: OpenAI, Anthropic, Google','Status: Raport i rewizja architektoniczna; bez wdrożeń']);
+});
+test('TXT-02: pola nie pochłaniają analizy, Risk Engine ani pozycji 4.',()=>{
+    const input='Data: 22 października 2026 r.\n\nAnaliza\n\nWszystkie dokumenty chcą Risk\n\nEngine z prawem veta.\n\n4.\n\nKontrola ryzyka\n\n20 strategii nie dowodzi «≤5% fałszywych przepuszczeń»,\n\na test wymaga czasu.';
+    const expected=['Data: 22 października 2026 r.','Analiza Wszystkie dokumenty chcą Risk Engine z prawem veta.',
+        '4. Kontrola ryzyka 20 strategii nie dowodzi «≤5% fałszywych przepuszczeń», a test wymaga czasu.'];
+    assert.deepEqual(segments(input),expected);
+    assert.equal(expected.join(' '),input.replace(/\s+/gu,' '));
+});
+test('TXT-02: po polu nie są wchłaniane alfabetyczne pozycje listy',()=>{
+    const input='Status: Do analizy\n\na) Pierwszy warunek\nb) Drugi warunek';
+    assert.deepEqual(segments(input),['Status: Do analizy','a) Pierwszy warunek','b) Drugi warunek']);
+});
+test('TXT-02: zwykłe słowa status, data i projekt nie wyznaczają granic',()=>{
+    const cases=[
+        'Status projektu zależy od danych, a data spotkania nie jest znana.',
+        'Omawiamy status: projekt trwa, data: nadal nieustalona, projekt: bez zmian.',
+        'W raporcie zapisano „status: roboczy, data: nieznana, projekt: w toku”.',
+        'Status jest następujący: data nie została ustalona, projekt trwa.',
+        'Wskazano projekt: Risk\n\nEngine, a status i data pozostają bez zmian.'
+    ];
+    for(const text of cases) {
+        const expected=text.replace(/\s+/gu,' ');
+        assert.deepEqual(segments(text),[expected]);
+        assert.equal(segments(text).join(' '),expected);
+    }
+    assert.deepEqual(segments('Projekt wymaga ustalenia daty i statusu. To pełna wypowiedź.'),
+        ['Projekt wymaga ustalenia daty i statusu.','To pełna wypowiedź.']);
+});
 (async () => {
     for (const [name, fn] of cases) {
         await fn();
