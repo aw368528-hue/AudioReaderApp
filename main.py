@@ -1,4 +1,7 @@
 import io
+import asyncio
+import logging
+import re
 import socket
 import tempfile
 import os
@@ -8,6 +11,7 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from pypdf import PdfReader
 import uvicorn
+from aiohttp import ClientError
 
 app = FastAPI()
 
@@ -172,7 +176,38 @@ HTML_PAGE = """
     let isReading = false;
     let isPaused = false;
     let audio = new Audio();
-    let prefetchCache = {};
+    let prefetchCache = new Map();
+    let session = 0;
+    let controller = new AbortController();
+    let ready = false;
+    let loading = false;
+
+    function splitSentences(text) {
+        const abbreviations = /(?:(?<![\\p{L}\\p{N}])(?:np|itd|itp|tj|tzn|tzw|dr|mgr|prof|inż|ul|al|im|nr|godz|r|str|ust|art|pkt|św|śp|ok|zob|por|ds|wg|m\\.in)|(?<![\\p{L}\\p{N}])[A-ZĄĆĘŁŃÓŚŹŻ])\\.$/iu;
+        const result = [];
+        for (const paragraph of text.replace(/\\r\\n?/g, '\\n').split(/\\n\\s*\\n/)) {
+            const normalized = paragraph.replace(/\\s+/g, ' ').trim();
+            let start = 0;
+            const boundaries = /[.!?]+[”’»"')\\]]*(?=\\s|$)/gu;
+            for (const match of normalized.matchAll(boundaries)) {
+                const end = match.index + match[0].length;
+                const candidate = normalized.slice(start, end);
+                if (match[0] === '.' && abbreviations.test(candidate)) continue;
+                if (candidate.trim()) result.push(candidate.trim());
+                start = end;
+            }
+            const tail = normalized.slice(start).trim();
+            if (tail) result.push(tail);
+        }
+        return result;
+    }
+
+    function clearAudioCache() {
+        for (const promise of prefetchCache.values()) {
+            promise.then(url => { if (url) URL.revokeObjectURL(url); }).catch(() => {});
+        }
+        prefetchCache = new Map();
+    }
 
     window.switchTab = function(tab) {
         document.getElementById('readerView').style.display = tab === 'reader' ? 'flex' : 'none';
@@ -183,7 +218,6 @@ HTML_PAGE = """
 
     window.applyText = function() {
         const text = document.getElementById('rawText').value.trim();
-        if (!text) return;
         renderSentences(text);
         window.switchTab('reader');
     };
@@ -192,9 +226,7 @@ HTML_PAGE = """
         window.stopReading();
         const box = document.getElementById('readerView');
         box.innerHTML = '';
-        sentences = text.split(/(?<=[.!?\\n])\\s+/).map(s => s.trim()).filter(Boolean);
-        if (sentences.length === 0) sentences = [text];
-        prefetchCache = {};
+        sentences = splitSentences(text);
 
         sentences.forEach((s, idx) => {
             const div = document.createElement('div');
@@ -232,103 +264,153 @@ HTML_PAGE = """
         }
     });
 
-    async function fetchAudioBlob(idx) {
+    async function fetchAudioBlob(idx, signal = controller.signal) {
+        const text = (sentences[idx] || '').trim();
+        if (!text) return null;
         const voice = document.getElementById('voiceSelect').value;
         const rate = document.getElementById('rateSlider').value;
-        const key = `${idx}_${voice}_${rate}`;
-        if (prefetchCache[key]) return prefetchCache[key];
+        const key = JSON.stringify([text, voice, rate]);
+        const cache = prefetchCache;
+        if (cache.has(key)) return cache.get(key);
+        const promise = (async () => {
+            for (let attempt = 0; attempt < 3; attempt++) {
+                if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
+                try {
+                    const formData = new FormData();
+                    formData.append('text', text);
+                    formData.append('voice', voice);
+                    formData.append('rate', rate);
+                    const response = await fetch('/tts', {method: 'POST', body: formData, signal});
+                    if (!response.ok) {
+                        const data = await response.json().catch(() => ({}));
+                        const message = typeof data.error === 'string' ? data.error :
+                            (response.status < 500 && response.status !== 429 ? 'Nieprawidłowe dane wejściowe TTS.' : 'Błąd komunikacji z serwerem TTS.');
+                        const error = new Error(`${message} (HTTP ${response.status})`);
+                        error.retryable = response.status === 429 || response.status >= 500;
+                        throw error;
+                    }
+                    const blob = await response.blob();
+                    if (!blob.size) throw new Error('Usługa TTS zwróciła puste audio.');
+                    if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
+                    return URL.createObjectURL(blob);
+                } catch (error) {
+                    if (error.name === 'AbortError' || signal.aborted) throw error;
+                    if (error.retryable === false || attempt === 2) {
+                        if (error instanceof TypeError) throw new Error('Błąd komunikacji z serwerem TTS. Sprawdź połączenie.');
+                        throw error;
+                    }
+                    await new Promise((resolve, reject) => {
+                        const cancel = () => { clearTimeout(timer); reject(new DOMException('Anulowano', 'AbortError')); };
+                        const timer = setTimeout(() => { signal.removeEventListener('abort', cancel); resolve(); }, 400 * (attempt + 1));
+                        signal.addEventListener('abort', cancel, {once: true});
+                    });
+                }
+            }
+        })();
+        cache.set(key, promise);
+        try { return await promise; }
+        catch (error) { if (cache.get(key) === promise) cache.delete(key); throw error; }
+    }
 
-        const formData = new FormData();
-        formData.append('text', sentences[idx]);
-        formData.append('voice', voice);
-        formData.append('rate', rate);
+    function playbackFailed(error, token) {
+        if (token !== session) return;
+        window.stopReading();
+        setStatus('Błąd odtwarzania: ' + error.message + ' Naciśnij ▶, aby ponowić bieżące zdanie.');
+    }
 
-        const promise = fetch('/tts', { method: 'POST', body: formData })
-            .then(r => {
-                if (!r.ok) throw new Error('TTS error');
-                return r.blob();
-            })
-            .then(blob => URL.createObjectURL(blob));
-        prefetchCache[key] = promise;
-        return promise;
+    async function playReady(token) {
+        if (token !== session || !isReading || isPaused || !ready) return;
+        setStatus(`Czytanie zdania ${currentIdx + 1} z ${sentences.length}`);
+        try { await audio.play(); }
+        catch (error) {
+            if (token === session && isPaused && error.name === 'AbortError') return;
+            playbackFailed(error, token);
+        }
     }
 
     async function playCurrent() {
-        if (!isReading || currentIdx >= sentences.length) {
+        const token = session;
+        while (currentIdx < sentences.length && !sentences[currentIdx].trim()) currentIdx++;
+        if (!isReading) return;
+        if (currentIdx >= sentences.length) {
             window.stopReading();
             setStatus('Zakończono czytanie');
             return;
         }
-
+        const idx = currentIdx;
+        const player = audio;
+        ready = false;
+        loading = true;
         document.querySelectorAll('.sentence').forEach(el => el.classList.remove('active'));
-        const activeEl = document.getElementById('sent-' + currentIdx);
+        const activeEl = document.getElementById('sent-' + idx);
         if (activeEl) {
             activeEl.classList.add('active');
-            activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
         }
-
-        document.getElementById('progressBar').style.width = (((currentIdx + 1) / sentences.length) * 100) + '%';
-        setStatus(`Generowanie AI (${currentIdx + 1}/${sentences.length})...`);
-
+        document.getElementById('progressBar').style.width = (((idx + 1) / sentences.length) * 100) + '%';
+        setStatus(`Generowanie AI (${idx + 1}/${sentences.length})...`);
         try {
-            const audioUrl = await fetchAudioBlob(currentIdx);
-            if (!isReading) return;
-
-            if (currentIdx + 1 < sentences.length) {
-                fetchAudioBlob(currentIdx + 1);
-            }
-
-            audio.src = audioUrl;
-            setStatus(`Czytanie zdania ${currentIdx + 1} z ${sentences.length}`);
-            await audio.play();
-        } catch (err) {
-            setStatus('Błąd odtwarzania: ' + err.message);
-        }
+            const audioUrl = await fetchAudioBlob(idx);
+            if (token !== session || !isReading) return;
+            loading = false;
+            player.src = audioUrl;
+            ready = true;
+            player.onended = () => {
+                if (token !== session || !isReading) return;
+                ready = false;
+                currentIdx++;
+                if (!isPaused) playCurrent();
+            };
+            player.onerror = () => playbackFailed(new Error('Nie można odtworzyć otrzymanego audio.'), token);
+            if (idx + 1 < sentences.length) fetchAudioBlob(idx + 1).catch(() => {});
+            await playReady(token);
+        } catch (error) { playbackFailed(error, token); }
     }
-
-    audio.onended = () => {
-        if (isReading && !isPaused) {
-            currentIdx++;
-            playCurrent();
-        }
-    };
 
     window.startFrom = function(idx) {
         window.stopReading();
         currentIdx = idx;
         isReading = true;
-        isPaused = false;
         document.getElementById('playBtn').innerText = '⏸';
         playCurrent();
     };
 
     window.togglePlay = function() {
         if (sentences.length === 0) {
-            const raw = document.getElementById('rawText').value.trim();
-            if (raw) renderSentences(raw);
-            else return setStatus('Najpierw wczytaj plik lub wklej tekst!');
+            renderSentences(document.getElementById('rawText').value);
+            if (!sentences.length) return setStatus('Najpierw wczytaj plik lub wklej tekst!');
         }
-
         if (!isReading) {
-            window.startFrom(currentIdx);
+            window.startFrom(currentIdx >= sentences.length ? 0 : currentIdx);
         } else if (!isPaused) {
-            audio.pause();
             isPaused = true;
+            audio.pause();
             document.getElementById('playBtn').innerText = '▶';
             setStatus('Wstrzymano');
         } else {
-            audio.play();
             isPaused = false;
             document.getElementById('playBtn').innerText = '⏸';
-            setStatus(`Czytanie zdania ${currentIdx + 1} z ${sentences.length}`);
+            if (ready) playReady(session);
+            else if (!loading) playCurrent();
+            else setStatus(`Generowanie AI (${currentIdx + 1}/${sentences.length})...`);
         }
     };
 
     window.stopReading = function() {
+        session++;
+        controller.abort();
+        controller = new AbortController();
         isReading = false;
         isPaused = false;
+        ready = false;
+        loading = false;
+        audio.onended = null;
+        audio.onerror = null;
         audio.pause();
-        audio.currentTime = 0;
+        audio.removeAttribute('src');
+        audio.load();
+        audio = new Audio();
+        clearAudioCache();
         document.getElementById('playBtn').innerText = '▶';
         setStatus('Zatrzymano');
     };
@@ -351,6 +433,32 @@ HTML_PAGE = """
 async def index():
     return HTML_PAGE
 
+def normalize_pdf_text(text: str) -> str:
+    """Join extraction line wraps while preserving visible paragraph clues."""
+    paragraphs = []
+    current = ""
+    previous_indent = None
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = re.sub(r"[ \t]+", " ", raw).strip()
+        if not line:
+            if current:
+                paragraphs.append(current)
+                current = ""
+            previous_indent = None
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        new_block = bool((previous_indent is not None and indent >= previous_indent + 2)
+                         or re.match(r"^(?:[•●▪–—-]|\d+[.)])\s+", line))
+        if current and new_block:
+            paragraphs.append(current)
+            current = ""
+        current = f"{current} {line}" if current else line
+        previous_indent = indent
+    if current:
+        paragraphs.append(current)
+    return "\n\n".join(paragraphs)
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
@@ -361,30 +469,42 @@ async def upload_file(file: UploadFile = File(...)):
             extracted = content.decode("utf-8", errors="ignore")
         elif name.endswith(".docx"):
             doc = docx.Document(io.BytesIO(content))
-            extracted = "\n".join([p.text for p in doc.paragraphs])
+            extracted = "\n\n".join([p.text for p in doc.paragraphs])
         elif name.endswith(".pdf"):
             reader = PdfReader(io.BytesIO(content))
-            for page in reader.pages:
-                t = page.extract_text()
-                if t:
-                    extracted += t + "\n"
+            extracted = "\n\n".join(
+                text for page in reader.pages
+                if (text := normalize_pdf_text(page.extract_text(extraction_mode="layout") or ""))
+            )
         return {"text": extracted}
     except Exception as e:
         return {"error": str(e)}
 
 @app.post("/tts")
-async def tts_endpoint(text: str = Form(...), voice: str = Form(...), rate: int = Form(...)):
-    rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
-    fd, path = tempfile.mkstemp(suffix=".mp3")
-    os.close(fd)
+async def tts_endpoint(text: str = Form(""), voice: str = Form(""), rate: int = Form(0)):
+    text = text.strip()
+    if not text or voice not in {"pl-PL-ZofiaNeural", "pl-PL-MarekNeural"} or not -50 <= rate <= 50:
+        return JSONResponse(status_code=400, content={"error": "Nieprawidłowe dane wejściowe TTS: wymagany tekst, obsługiwany głos i tempo od -50 do 50.", "code": "invalid_input"})
+    rate_str = f"{rate:+d}%"
+    path = None
     try:
+        fd, path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
         comm = edge_tts.Communicate(text, voice, rate=rate_str)
-        await comm.save(path)
+        await asyncio.wait_for(comm.save(path), timeout=45)
         with open(path, "rb") as f:
             audio_bytes = f.read()
+        if not audio_bytes:
+            raise ValueError("Empty audio response")
         return Response(content=audio_bytes, media_type="audio/mpeg")
+    except (asyncio.TimeoutError, ClientError, ConnectionError, OSError):
+        logging.exception("TTS communication failure")
+        return JSONResponse(status_code=503, content={"error": "Błąd komunikacji z usługą syntezy. Spróbuj ponownie.", "code": "communication_error"})
+    except Exception:
+        logging.exception("TTS synthesis failure")
+        return JSONResponse(status_code=502, content={"error": "Usługa syntezy nie wygenerowała audio. Spróbuj ponownie.", "code": "synthesis_error"})
     finally:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             try:
                 os.remove(path)
             except OSError:
