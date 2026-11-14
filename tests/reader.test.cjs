@@ -2,10 +2,9 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const script = fs.readFileSync(0, 'utf8');
-const tick = () => new Promise(resolve => setImmediate(resolve));
-async function settle() { for (let n = 0; n < 12; n++) await tick(); }
+async function settle() { for (let n = 0; n < 12; n++) await new Promise(r => setTimeout(r, 1)); }
 const ok = () => ({ok: true, blob: async () => ({size: 10})});
-const failed = (status = 502) => ({ok: false, status, json: async () => ({error: 'Błąd syntezy'})});
+const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
 function harness(fetch) {
     const elements = new Map();
     function element() {
@@ -21,16 +20,19 @@ function harness(fetch) {
         load() {}
         removeAttribute() { this.src = ''; }
     }
+    let now = 0;
+    const delays = [];
+    class Clock extends Date { static now() { return now; } }
     const context = vm.createContext({window: {}, document: {
         getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
         createElement: element, querySelectorAll: () => []}, Audio, fetch, FormData, AbortController,
         DOMException, TypeError, URL: {createObjectURL: () => `blob:${Math.random()}`, revokeObjectURL() {}},
-        setTimeout: fn => setTimeout(fn, 0), clearTimeout, alert() {}});
+        Date: Clock, setTimeout: (fn, ms) => { delays.push(ms); return setTimeout(() => { now += ms; fn(); }, 0); }, clearTimeout, alert() {}});
     vm.runInContext(script, context);
     const run = code => vm.runInContext(code, context);
     context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
     context.document.getElementById('rateSlider').value = '0';
-    return {run, context, elements, audios};
+    return {run, context, elements, audios, delays};
 }
 const cases = [];
 function test(name, fn) { cases.push([name, fn]); }
@@ -103,6 +105,7 @@ test('Pauza podczas generowania i wznowienie', async () => {
     let resolve;
     const h = harness(() => new Promise(r => { resolve = r; }));
     h.run('sentences = ["Tekst."]; window.startFrom(0); window.togglePlay()');
+    await settle();
     resolve(ok());
     await settle();
     assert.equal(h.run('audio.plays'), 0);
@@ -124,8 +127,10 @@ test('Spóźniona odpowiedź i stare zdarzenia nie zmieniają nowej sesji', asyn
     const pending = [];
     const h = harness(() => new Promise(resolve => pending.push(resolve)));
     h.run('sentences = ["Stary."]; window.startFrom(0)');
+    await settle();
     const oldPlayer = h.audios.at(-1);
     h.run('sentences = ["Nowy."]; window.startFrom(0)');
+    await settle();
     pending[1](ok());
     await settle();
     const newSource = h.run('audio.src');
@@ -135,23 +140,22 @@ test('Spóźniona odpowiedź i stare zdarzenia nie zmieniają nowej sesji', asyn
     assert.equal(oldPlayer.plays, 0);
     assert.equal(h.run('audio.plays'), 1);
 });
-test('Błąd prefetch nie blokuje następnego zdania', async () => {
-    let failNext = true;
-    const h = harness(async (url, options) => options.body.get('text') === 'Drugie.' && failNext ? failed(400) : ok());
+test('Nie generuje następnego fragmentu przed końcem aktywnego', async () => {
+    let calls = 0;
+    const h = harness(async () => { calls++; return ok(); });
     h.run('sentences = ["Pierwsze.", "Drugie."]; window.startFrom(0)');
     await settle();
-    failNext = false;
+    assert.equal(calls, 1);
     h.run('audio.onended()');
     await settle();
-    assert.equal(h.run('currentIdx'), 1);
-    assert.equal(h.run('audio.plays'), 2);
+    assert.equal(calls, 2);
 });
 test('Błąd TTS zatrzymuje sesję i pozwala ponowić to samo zdanie', async () => {
     const h = harness(async () => failed(400));
     h.run('sentences = ["Tekst."]; window.startFrom(0)');
     await settle();
     assert.equal(h.run('isReading'), false);
-    assert.match(h.context.document.getElementById('statusText').innerText, /ponowić bieżące zdanie/);
+    assert.match(h.context.document.getElementById('statusText').innerText, /wznowić ten sam fragment/);
     h.context.fetch = async () => ok();
     h.run('window.togglePlay()');
     await settle();
@@ -175,6 +179,116 @@ test('Błąd dekodowania audio jest obsłużony', async () => {
     h.run('audio.onerror()');
     assert.equal(h.run('isReading'), false);
     assert.match(h.context.document.getElementById('statusText').innerText, /Nie można odtworzyć/);
+});
+test('Kolejne NoAudioReceived: 3 próby z przerwą, wznowienie tego samego fragmentu', async () => {
+    let calls = 0;
+    const h = harness(async () => {
+        calls++;
+        return {ok: false, status: 502, headers: {get: () => '10'},
+            json: async () => ({error: 'Brak audio', code: 'no_audio', retryable: true})};
+    });
+    h.run('sentences = ["Pierwsze.", "Drugie."]; window.startFrom(0)');
+    // Timer callbacks model virtual seconds without a real wait.
+    for (let n = 0; n < 30; n++) await new Promise(r => setTimeout(r, 1));
+    assert.equal(calls, 3);
+    assert.deepEqual(h.delays, [10000, 10000]);
+    assert.equal(h.run('currentIdx'), 0);
+    assert.equal(h.run('isReading'), false);
+    assert.match(h.context.document.getElementById('statusText').innerText, /Wyczerpano 3 próby/);
+    h.context.fetch = async () => { calls++; return ok(); };
+    h.run('window.togglePlay()');
+    for (let n = 0; n < 10; n++) await new Promise(r => setTimeout(r, 1));
+    assert.equal(calls, 4);
+    assert.equal(h.run('currentIdx'), 0);
+    assert.equal(h.delays.at(-1), 10000);
+});
+test('Zatrzymanie w czasie przerwy anuluje kolejne próby', async () => {
+    let calls = 0;
+    const h = harness(async () => { calls++; return failed(); });
+    const timers = [];
+    h.context.setTimeout = (callback, delay) => { timers.push(callback); return 1; };
+    h.context.clearTimeout = () => {};
+    h.run('sentences = ["Tekst."]; window.startFrom(0)');
+    await settle();
+    assert.equal(calls, 1);
+    assert.equal(timers.length, 1);
+    h.run('window.stopReading()');
+    await settle();
+    assert.equal(calls, 1);
+    assert.equal(h.run('isReading'), false);
+});
+test('Odrzucenie dostawcy nie jest automatycznie ponawiane', async () => {
+    let calls = 0;
+    const h = harness(async () => { calls++; return {ok: false, status: 503,
+        headers: {get: () => '30'}, json: async () => ({error: 'Odrzucono', retryable: false})}; });
+    h.run('sentences = ["Tekst."]');
+    await assert.rejects(h.run('fetchAudioBlob(0)'), /Odrzucono/);
+    assert.equal(calls, 1);
+    assert.equal(h.run('ttsNotBefore'), 30000);
+});
+test('Oczekiwanie pokazuje próbę i przerwę; pauza nie uruchamia audio', async () => {
+    let calls = 0;
+    const h = harness(async () => ++calls === 1 ? failed() : ok());
+    const timers = [];
+    h.context.setTimeout = callback => { timers.push(callback); return 1; };
+    h.context.clearTimeout = () => {};
+    h.run('sentences = ["Poprzednie.", "Bieżące."]; window.startFrom(1)');
+    await settle();
+    const status = h.context.document.getElementById('statusText');
+    assert.match(status.innerText, /Oczekiwanie na TTS.*3 s.*próba 2\/3.*zdanie 2\/2/);
+    h.run('window.togglePlay()');
+    assert.equal(status.innerText, 'Wstrzymano');
+    h.run('window.togglePlay()');
+    assert.match(status.innerText, /Oczekiwanie na TTS/);
+    h.run('window.togglePlay(); ttsNotBefore = 0');
+    timers.shift()();
+    await settle();
+    assert.equal(h.run('currentIdx'), 1);
+    assert.equal(h.run('audio.plays'), 0);
+    assert.equal(status.innerText, 'Wstrzymano');
+    h.run('window.togglePlay()');
+    await settle();
+    assert.equal(calls, 2);
+    assert.equal(h.run('audio.plays'), 1);
+});
+test('Dwie nieudane próby odtwarzają zdanie raz i przesuwają pozycję raz', async () => {
+    let calls = 0;
+    const h = harness(async () => ++calls <= 2 ? failed() : ok());
+    h.run('sentences = ["Pierwsze.", "Drugie."]; window.startFrom(0)');
+    await settle();
+    assert.equal(calls, 3);
+    assert.equal(h.run('audio.plays'), 1);
+    assert.equal(h.run('currentIdx'), 0);
+    const ended = h.run('audio.onended');
+    ended();
+    ended();
+    await settle();
+    assert.equal(calls, 4);
+    assert.equal(h.run('currentIdx'), 1);
+    assert.equal(h.run('audio.plays'), 2);
+    h.run('audio.onended()');
+    assert.equal(h.run('isReading'), false);
+    assert.equal(h.run('currentIdx'), 2);
+});
+test('Przejście dalej podczas oczekiwania nie przywraca starego zdania', async () => {
+    const texts = [];
+    const h = harness(async (url, options) => {
+        const text = options.body.get('text'); texts.push(text);
+        return text === 'Pierwsze.' ? failed() : ok();
+    });
+    const timers = [];
+    h.context.setTimeout = callback => { timers.push(callback); return timers.length; };
+    h.context.clearTimeout = () => {};
+    h.run('sentences = ["Pierwsze.", "Drugie."]; window.startFrom(0)');
+    await settle();
+    h.run('window.skip(1)');
+    await settle();
+    h.run('ttsNotBefore = 0');
+    for (const callback of timers) callback();
+    await settle();
+    assert.deepEqual(texts, ['Pierwsze.', 'Drugie.']);
+    assert.equal(h.run('currentIdx'), 1);
+    assert.equal(h.run('audio.plays'), 1);
 });
 (async () => {
     for (const [name, fn] of cases) {

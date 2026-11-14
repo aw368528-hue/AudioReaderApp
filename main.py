@@ -2,6 +2,10 @@ import io
 import asyncio
 import logging
 import re
+import time
+import uuid
+from importlib.metadata import version
+from email.utils import parsedate_to_datetime
 import socket
 import tempfile
 import os
@@ -9,11 +13,16 @@ import docx
 import edge_tts
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pypdf import PdfReader
 import uvicorn
-from aiohttp import ClientError
+from aiohttp import ClientError, ClientResponseError, ClientConnectorError
+from edge_tts.exceptions import NoAudioReceived
 
 app = FastAPI()
+TTS_VERSION = version("edge-tts")
+TTS_LOG = logging.getLogger("uvicorn.error.tts")
+TTS_LOG.setLevel(logging.INFO)
 
 @app.get("/manifest.json")
 async def manifest():
@@ -181,6 +190,8 @@ HTML_PAGE = """
     let controller = new AbortController();
     let ready = false;
     let loading = false;
+    let ttsNotBefore = 0;
+    let ttsAttempt = 1;
 
     function splitSentences(text) {
         const abbreviations = /(?:(?<![\\p{L}\\p{N}])(?:np|itd|itp|tj|tzn|tzw|dr|mgr|prof|inż|ul|al|im|nr|godz|r|str|ust|art|pkt|św|śp|ok|zob|por|ds|wg|m\\.in)|(?<![\\p{L}\\p{N}])[A-ZĄĆĘŁŃÓŚŹŻ])\\.$/iu;
@@ -264,6 +275,26 @@ HTML_PAGE = """
         }
     });
 
+    function showGenerationStatus() {
+        if (!isReading || isPaused) return;
+        const seconds = Math.max(0, Math.ceil((ttsNotBefore - Date.now()) / 1000));
+        setStatus(seconds > 0
+            ? `Oczekiwanie na TTS • przerwa ${seconds} s • próba ${ttsAttempt}/3 • zdanie ${currentIdx + 1}/${sentences.length}`
+            : `Generowanie AI (${currentIdx + 1}/${sentences.length}) • próba ${ttsAttempt}/3...`);
+    }
+
+    async function waitForTts(signal) {
+        while (ttsNotBefore > Date.now()) {
+            if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
+            await new Promise((resolve, reject) => {
+                const cancel = () => { clearTimeout(timer); reject(new DOMException('Anulowano', 'AbortError')); };
+                const timer = setTimeout(() => { signal.removeEventListener('abort', cancel); resolve(); }, ttsNotBefore - Date.now());
+                signal.addEventListener('abort', cancel, {once: true});
+            });
+        }
+        if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
+    }
+
     async function fetchAudioBlob(idx, signal = controller.signal) {
         const text = (sentences[idx] || '').trim();
         if (!text) return null;
@@ -275,6 +306,12 @@ HTML_PAGE = """
         const promise = (async () => {
             for (let attempt = 0; attempt < 3; attempt++) {
                 if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
+                if (signal === controller.signal && isReading) {
+                    ttsAttempt = attempt + 1;
+                    showGenerationStatus();
+                }
+                await waitForTts(signal);
+                if (signal === controller.signal) showGenerationStatus();
                 try {
                     const formData = new FormData();
                     formData.append('text', text);
@@ -286,24 +323,34 @@ HTML_PAGE = """
                         const message = typeof data.error === 'string' ? data.error :
                             (response.status < 500 && response.status !== 429 ? 'Nieprawidłowe dane wejściowe TTS.' : 'Błąd komunikacji z serwerem TTS.');
                         const error = new Error(`${message} (HTTP ${response.status})`);
-                        error.retryable = response.status === 429 || response.status >= 500;
+                        error.retryable = typeof data.retryable === 'boolean' ? data.retryable :
+                            response.status === 429 || response.status >= 500;
+                        const retryHeader = response.headers.get('Retry-After');
+                        const seconds = Number(retryHeader);
+                        const delay = retryHeader && !Number.isFinite(seconds) ? Date.parse(retryHeader) - Date.now() : seconds * 1000;
+                        error.retryDelay = Number.isFinite(delay) ? Math.max(0, delay) : 0;
                         throw error;
                     }
                     const blob = await response.blob();
-                    if (!blob.size) throw new Error('Usługa TTS zwróciła puste audio.');
+                    if (!blob.size) {
+                        const error = new Error('Usługa TTS nie zwróciła audio.');
+                        error.retryDelay = 10000;
+                        throw error;
+                    }
                     if (signal.aborted) throw new DOMException('Anulowano', 'AbortError');
                     return URL.createObjectURL(blob);
                 } catch (error) {
                     if (error.name === 'AbortError' || signal.aborted) throw error;
+                    if (error.retryable !== false || error.retryDelay > 0) {
+                        ttsNotBefore = Math.max(ttsNotBefore, Date.now() + Math.max(error.retryDelay || 0, 3000));
+                    }
                     if (error.retryable === false || attempt === 2) {
-                        if (error instanceof TypeError) throw new Error('Błąd komunikacji z serwerem TTS. Sprawdź połączenie.');
+                        if (error instanceof TypeError) error = new Error('Błąd komunikacji z serwerem TTS. Sprawdź połączenie.');
+                        if (attempt === 2 && error.retryable !== false) error.message += ' Wyczerpano 3 próby.';
                         throw error;
                     }
-                    await new Promise((resolve, reject) => {
-                        const cancel = () => { clearTimeout(timer); reject(new DOMException('Anulowano', 'AbortError')); };
-                        const timer = setTimeout(() => { signal.removeEventListener('abort', cancel); resolve(); }, 400 * (attempt + 1));
-                        signal.addEventListener('abort', cancel, {once: true});
-                    });
+                    // A single retry owner; retain the cooldown across stop/resume.
+                    ttsNotBefore = Math.max(ttsNotBefore, Date.now() + Math.max(error.retryDelay || 0, attempt === 0 ? 3000 : 8000));
                 }
             }
         })();
@@ -315,7 +362,7 @@ HTML_PAGE = """
     function playbackFailed(error, token) {
         if (token !== session) return;
         window.stopReading();
-        setStatus('Błąd odtwarzania: ' + error.message + ' Naciśnij ▶, aby ponowić bieżące zdanie.');
+        setStatus('Błąd odtwarzania: ' + error.message + ' Naciśnij ▶, aby wznowić ten sam fragment po przerwie.');
     }
 
     async function playReady(token) {
@@ -338,6 +385,7 @@ HTML_PAGE = """
             return;
         }
         const idx = currentIdx;
+        ttsAttempt = 1;
         const player = audio;
         ready = false;
         loading = true;
@@ -356,13 +404,14 @@ HTML_PAGE = """
             player.src = audioUrl;
             ready = true;
             player.onended = () => {
-                if (token !== session || !isReading) return;
+                if (token !== session || !isReading || currentIdx !== idx) return;
+                player.onended = null;
                 ready = false;
                 currentIdx++;
                 if (!isPaused) playCurrent();
             };
             player.onerror = () => playbackFailed(new Error('Nie można odtworzyć otrzymanego audio.'), token);
-            if (idx + 1 < sentences.length) fetchAudioBlob(idx + 1).catch(() => {});
+            // Generate only the active fragment; no speculative retries in parallel.
             await playReady(token);
         } catch (error) { playbackFailed(error, token); }
     }
@@ -392,7 +441,7 @@ HTML_PAGE = """
             document.getElementById('playBtn').innerText = '⏸';
             if (ready) playReady(session);
             else if (!loading) playCurrent();
-            else setStatus(`Generowanie AI (${currentIdx + 1}/${sentences.length})...`);
+            else showGenerationStatus();
         }
     };
 
@@ -480,29 +529,82 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         return {"error": str(e)}
 
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, error):
+    if request.url.path != "/tts":
+        from fastapi.exception_handlers import request_validation_exception_handler
+        return await request_validation_exception_handler(request, error)
+    request_id = uuid.uuid4().hex
+    TTS_LOG.warning("tts request_id=%s category=invalid_input edge_tts=%s validation_errors=%d",
+                    request_id, TTS_VERSION, len(error.errors()))
+    return JSONResponse(status_code=422, headers={"X-TTS-Request-ID": request_id},
+                        content={"error": "Nieprawidłowy format danych wejściowych TTS.",
+                                 "code": "invalid_input", "retryable": False, "request_id": request_id})
+
+
 @app.post("/tts")
 async def tts_endpoint(text: str = Form(""), voice: str = Form(""), rate: int = Form(0)):
+    started = time.monotonic()
+    request_id = uuid.uuid4().hex
     text = text.strip()
-    if not text or voice not in {"pl-PL-ZofiaNeural", "pl-PL-MarekNeural"} or not -50 <= rate <= 50:
-        return JSONResponse(status_code=400, content={"error": "Nieprawidłowe dane wejściowe TTS: wymagany tekst, obsługiwany głos i tempo od -50 do 50.", "code": "invalid_input"})
-    rate_str = f"{rate:+d}%"
+
+    def diagnostic(category, exception=None, provider_status=None, audio_bytes=0):
+        # Never log document text, exception messages, provider URLs or payloads.
+        TTS_LOG.log(
+            logging.INFO if category == "success" else logging.WARNING,
+            "tts request_id=%s category=%s edge_tts=%s chars=%d voice=%s rate=%d elapsed_ms=%d exception=%s provider_status=%s audio_bytes=%d",
+            request_id, category, TTS_VERSION, len(text),
+            voice if voice in {"pl-PL-ZofiaNeural", "pl-PL-MarekNeural"} else "invalid",
+            rate, int((time.monotonic() - started) * 1000),
+            type(exception).__name__ if exception else "none", provider_status, audio_bytes,
+        )
+
+    def failure(status, code, message, retryable, exception=None, retry_after=None, provider_status=None):
+        diagnostic(code, exception, provider_status)
+        headers = {"X-TTS-Request-ID": request_id}
+        if retry_after is not None:
+            headers["Retry-After"] = str(retry_after)
+        return JSONResponse(status_code=status, headers=headers,
+                            content={"error": message, "code": code, "retryable": retryable, "request_id": request_id})
+
+    if not text or not any(char.isalnum() for char in text) or voice not in {"pl-PL-ZofiaNeural", "pl-PL-MarekNeural"} or not -50 <= rate <= 50:
+        return failure(400, "invalid_input", "Nieprawidłowe dane TTS: wymagany tekst z literą lub cyfrą, obsługiwany głos i tempo od -50 do 50.", False)
     path = None
     try:
         fd, path = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
-        comm = edge_tts.Communicate(text, voice, rate=rate_str)
+        comm = edge_tts.Communicate(text, voice, rate=f"{rate:+d}%")
         await asyncio.wait_for(comm.save(path), timeout=45)
         with open(path, "rb") as f:
             audio_bytes = f.read()
         if not audio_bytes:
-            raise ValueError("Empty audio response")
-        return Response(content=audio_bytes, media_type="audio/mpeg")
-    except (asyncio.TimeoutError, ClientError, ConnectionError, OSError):
-        logging.exception("TTS communication failure")
-        return JSONResponse(status_code=503, content={"error": "Błąd komunikacji z usługą syntezy. Spróbuj ponownie.", "code": "communication_error"})
-    except Exception:
-        logging.exception("TTS synthesis failure")
-        return JSONResponse(status_code=502, content={"error": "Usługa syntezy nie wygenerowała audio. Spróbuj ponownie.", "code": "synthesis_error"})
+            raise NoAudioReceived("Empty audio response")
+        diagnostic("success", audio_bytes=len(audio_bytes))
+        return Response(content=audio_bytes, media_type="audio/mpeg", headers={"X-TTS-Request-ID": request_id})
+    except NoAudioReceived as error:
+        return failure(502, "no_audio", "Usługa syntezy nie zwróciła audio. Spróbuj ponownie po przerwie.", True, error, 10)
+    except asyncio.TimeoutError as error:
+        return failure(504, "timeout", "Przekroczono czas oczekiwania na syntezę.", True, error, 8)
+    except ClientResponseError as error:
+        # Do not evade explicit provider refusals with repeated connections.
+        retry_after = 30
+        provider_delay = (error.headers or {}).get("Retry-After", "")
+        try:
+            retry_after = max(retry_after, int(provider_delay))
+        except (ValueError, TypeError):
+            try:
+                retry_after = max(retry_after, int(parsedate_to_datetime(provider_delay).timestamp() - time.time()) + 1)
+            except (ValueError, TypeError, OverflowError):
+                pass
+        return failure(503, "connection_rejected", "Dostawca syntezy odrzucił połączenie. Spróbuj później.", False, error, retry_after, error.status)
+    except (ClientConnectorError, ConnectionRefusedError) as error:
+        return failure(503, "connection_refused", "Nie udało się nawiązać połączenia z usługą syntezy.", True, error, 8)
+    except (ClientError, ConnectionError, OSError) as error:
+        return failure(503, "communication_error", "Błąd komunikacji z usługą syntezy.", True, error, 8)
+    except ValueError as error:
+        return failure(400, "invalid_input", "Usługa syntezy nie zaakceptowała danych wejściowych.", False, error)
+    except Exception as error:
+        return failure(502, "synthesis_error", "Usługa syntezy nie wygenerowała audio.", True, error, 8)
     finally:
         if path and os.path.exists(path):
             try:

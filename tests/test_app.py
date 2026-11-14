@@ -77,7 +77,7 @@ class ReaderTests(unittest.TestCase):
         self.addCleanup(logging.disable, logging.NOTSET)
         for error, code, category in [(RuntimeError('provider'), 502, 'synthesis_error'),
                                       (main.ClientError('network'), 503, 'communication_error'),
-                                      (TimeoutError(), 503, 'communication_error')]:
+                                      (TimeoutError(), 504, 'timeout')]:
             paths = []
             async def fail(path):
                 paths.append(path)
@@ -109,6 +109,37 @@ class ReaderTests(unittest.TestCase):
             communicate.return_value.save = AsyncMock()
             response = self.client.post('/tts', data={'text': 'Tekst', 'voice': 'pl-PL-ZofiaNeural'})
         self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()['code'], 'no_audio')
+
+    def test_repeated_no_audio_diagnostics(self):
+        secret = 'PRYWATNY-TEKST-TESTOWY'
+        for _ in range(3):
+            with patch.object(main.edge_tts, 'Communicate') as communicate, self.assertLogs('uvicorn.error.tts') as logs:
+                communicate.return_value.save = AsyncMock(side_effect=main.NoAudioReceived(secret))
+                response = self.client.post('/tts', data={'text': secret, 'voice': 'pl-PL-ZofiaNeural'})
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.json()['code'], 'no_audio')
+            self.assertTrue(response.json()['retryable'])
+            self.assertEqual(response.headers['retry-after'], '10')
+            self.assertIn('edge_tts=' + main.TTS_VERSION, logs.output[0])
+            self.assertIn('exception=NoAudioReceived', logs.output[0])
+            self.assertNotIn(secret, ''.join(logs.output) + response.text)
+            self.assertEqual(response.headers['x-tts-request-id'], response.json()['request_id'])
+
+    def test_connection_refusal_and_provider_rejection(self):
+        from aiohttp import ClientResponseError
+        errors = [(ConnectionRefusedError('secret'), 'connection_refused', True),
+                  (ClientResponseError(None, (), status=429, message='secret', headers={'Retry-After': '120'}), 'connection_rejected', False)]
+        for error, code, retryable in errors:
+            with patch.object(main.edge_tts, 'Communicate') as communicate, self.assertLogs('uvicorn.error.tts') as logs:
+                communicate.return_value.save = AsyncMock(side_effect=error)
+                response = self.client.post('/tts', data={'text': 'Test', 'voice': 'pl-PL-MarekNeural'})
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()['code'], code)
+            self.assertEqual(response.json()['retryable'], retryable)
+            self.assertNotIn('secret', ''.join(logs.output))
+            if code == 'connection_rejected':
+                self.assertEqual(response.headers['retry-after'], '120')
 
     def test_frontend(self):
         # Test the actual JavaScript returned by FastAPI, after Python escaping.
