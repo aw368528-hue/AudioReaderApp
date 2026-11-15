@@ -130,6 +130,28 @@ HTML_PAGE = """
             padding: 8px 12px; border-radius: 10px; font-weight: 500; outline: none;
         }
         input[type="range"] { flex: 1; accent-color: var(--primary); }
+        .resume-panel {
+            background: var(--surface); border: 1px solid var(--surface-light); border-radius: 12px;
+            padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px;
+            color: var(--text-muted); font-size: 0.78rem;
+        }
+        .resume-panel[hidden] { display: none; }
+        .resume-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+        .resume-title { color: var(--text); font-weight: 600; }
+        .resume-name { overflow-wrap: anywhere; }
+        .resume-note { font-size: 0.68rem; }
+        .resume-actions { display: flex; flex: 0 0 auto; gap: 6px; }
+        .resume-actions button {
+            border: 0; border-radius: 9px; padding: 8px 10px; font: inherit; font-weight: 600;
+            color: var(--text); background: var(--surface-light); cursor: pointer;
+        }
+        .resume-actions button.primary { background: var(--primary); color: white; }
+        .resume-actions button[hidden] { display: none; }
+        @media (max-width: 520px) {
+            .resume-panel { align-items: flex-start; flex-direction: column; }
+            .resume-actions { width: 100%; }
+            .resume-actions button { flex: 1; }
+        }
     </style>
 </head>
 <body>
@@ -147,6 +169,18 @@ HTML_PAGE = """
         <button class="tab-btn active" id="tabReader" onclick="window.switchTab('reader')">🎧 Lektor</button>
         <button class="tab-btn" id="tabEditor" onclick="window.switchTab('editor')">📝 Wklej tekst</button>
     </div>
+
+    <section class="resume-panel" id="resumePanel" aria-live="polite">
+        <div class="resume-copy">
+            <span class="resume-title" id="resumeTitle">Zapis lokalny</span>
+            <span class="resume-name" id="resumeName">Sprawdzanie zapamiętanego dokumentu…</span>
+            <span class="resume-note" id="resumeNote">Tekst jest zapamiętywany lokalnie w tej przeglądarce. Chrome i Edge nie współdzielą zapisu.</span>
+        </div>
+        <div class="resume-actions">
+            <button class="primary" id="resumeContinue" onclick="window.continueSavedDocument()" hidden>Kontynuuj od tego miejsca</button>
+            <button id="resumeDelete" onclick="window.deleteSavedDocument()" hidden>Usuń zapamiętany dokument</button>
+        </div>
+    </section>
 
     <div class="view-box" id="readerView">
         <div style="color:var(--text-muted); text-align:center; margin:auto;">
@@ -198,6 +232,216 @@ HTML_PAGE = """
     const mediaSession = typeof navigator !== 'undefined' && navigator.mediaSession ? navigator.mediaSession : null;
     let ttsNotBefore = 0;
     let ttsAttempt = 1;
+    const RESUME_DB_NAME = 'AudioReaderAI';
+    const RESUME_DB_VERSION = 1;
+    const RESUME_STORE = 'documents';
+    const RESUME_KEY = 'last';
+    const SEGMENTATION_VERSION = 1;
+    const RESUME_SAVE_INTERVAL_MS = 10000;
+    let resumeDbPromise = null;
+    let resumeWriteQueue = Promise.resolve();
+    let resumeDocumentRevision = 0;
+    let resumeUserAction = 0;
+    let lastProgressSaveAt = 0;
+    let lastProgressSavedIndex = null;
+    let resumeStoredRecord = null;
+    let currentDocument = null;
+    let resumeSavingEnabled = true;
+
+    function resumeMessage(title, detail, record = null) {
+        const panel = document.getElementById('resumePanel');
+        if (!panel) return;
+        panel.hidden = false;
+        document.getElementById('resumeTitle').textContent = title;
+        document.getElementById('resumeName').textContent = detail;
+        document.getElementById('resumeNote').textContent = 'Tekst jest zapamiętywany lokalnie w tej przeglądarce. Chrome i Edge nie współdzielą zapisu.';
+        document.getElementById('resumeContinue').hidden = !record;
+        document.getElementById('resumeDelete').hidden = !record;
+        if (record) document.getElementById('resumeContinue').textContent = record.completed
+            ? 'Czytaj od początku' : 'Kontynuuj od tego miejsca';
+    }
+
+    function openResumeDatabase() {
+        if (resumeDbPromise) return resumeDbPromise;
+        resumeDbPromise = new Promise((resolve, reject) => {
+            if (!window.indexedDB) return reject(new Error('indexeddb_unavailable'));
+            let request;
+            try { request = window.indexedDB.open(RESUME_DB_NAME, RESUME_DB_VERSION); }
+            catch (error) { reject(error); return; }
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(RESUME_STORE)) db.createObjectStore(RESUME_STORE, {keyPath: 'id'});
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('indexeddb_open_failed'));
+            request.onblocked = () => reject(new Error('indexeddb_blocked'));
+        }).catch(error => { resumeDbPromise = null; throw error; });
+        return resumeDbPromise;
+    }
+
+    async function readResumeRecord() {
+        const db = await openResumeDatabase();
+        return new Promise((resolve, reject) => {
+            let request;
+            try { request = db.transaction(RESUME_STORE, 'readonly').objectStore(RESUME_STORE).get(RESUME_KEY); }
+            catch (error) { reject(error); return; }
+            request.onsuccess = () => resolve(request.result || null);
+            request.onerror = () => reject(request.error || new Error('indexeddb_read_failed'));
+        });
+    }
+
+    async function writeResumeRecord(record) {
+        const db = await openResumeDatabase();
+        return new Promise((resolve, reject) => {
+            let transaction;
+            try {
+                transaction = db.transaction(RESUME_STORE, 'readwrite');
+                transaction.objectStore(RESUME_STORE).put(record);
+            } catch (error) { reject(error); return; }
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error || new Error('indexeddb_write_failed'));
+            transaction.onabort = () => reject(transaction.error || new Error('indexeddb_write_failed'));
+        });
+    }
+
+    async function eraseResumeRecord() {
+        const db = await openResumeDatabase();
+        return new Promise((resolve, reject) => {
+            let transaction;
+            try {
+                transaction = db.transaction(RESUME_STORE, 'readwrite');
+                transaction.objectStore(RESUME_STORE).delete(RESUME_KEY);
+            } catch (error) { reject(error); return; }
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error || new Error('indexeddb_delete_failed'));
+            transaction.onabort = () => reject(transaction.error || new Error('indexeddb_delete_failed'));
+        });
+    }
+
+    function safeResumeBlocks(blocks, textLength) {
+        if (!Array.isArray(blocks)) return null;
+        return blocks.map(block => {
+            if (!block || !Number.isInteger(block.start) || !Number.isInteger(block.end) ||
+                block.start < 0 || block.end <= block.start || block.end > textLength || typeof block.kind !== 'string') return null;
+            return {start: block.start, end: block.end, kind: block.kind};
+        }).every(Boolean) ? blocks.map(({start, end, kind}) => ({start, end, kind})) : null;
+    }
+
+    function validResumeRecord(record) {
+        if (!record || record.id !== RESUME_KEY || record.version !== RESUME_DB_VERSION ||
+            record.segmentationVersion !== SEGMENTATION_VERSION || typeof record.text !== 'string' ||
+            !record.text.trim() || typeof record.name !== 'string' || !Array.isArray(record.blocks) ||
+            !Number.isInteger(record.sentenceCount) || !Number.isInteger(record.index) ||
+            typeof record.completed !== 'boolean' || !['pl-PL-ZofiaNeural', 'pl-PL-MarekNeural'].includes(record.voice) ||
+            !Number.isInteger(Number(record.rate)) || String(Number(record.rate)) !== String(record.rate) ||
+            Number(record.rate) < -50 || Number(record.rate) > 50 || Number(record.rate) % 10 !== 0 ||
+            record.sentenceCount < 1) return false;
+        if (record.index < 0 || record.index > record.sentenceCount || (!record.completed && record.index >= record.sentenceCount)) return false;
+        return safeResumeBlocks(record.blocks, record.text.length) !== null;
+    }
+
+    function makeResumeRecord() {
+        if (!currentDocument) return null;
+        const blocks = safeResumeBlocks(currentDocument.blocks, currentDocument.text.length);
+        if (!blocks) return null;
+        return {id: RESUME_KEY, version: RESUME_DB_VERSION, segmentationVersion: SEGMENTATION_VERSION,
+            text: currentDocument.text, name: currentDocument.name, blocks, sentenceCount: sentences.length,
+            index: currentDocument.completed ? sentences.length : Math.max(0, Math.min(currentIdx, Math.max(0, sentences.length - 1))),
+            completed: !!currentDocument.completed,
+            voice: document.getElementById('voiceSelect').value,
+            rate: String(document.getElementById('rateSlider').value), savedAt: Date.now()};
+    }
+
+    function saveResumeProgress(force = false) {
+        if (!currentDocument || !resumeSavingEnabled || !sentences.length) return;
+        const now = Date.now();
+        if (!force && currentIdx === lastProgressSavedIndex && now - lastProgressSaveAt < RESUME_SAVE_INTERVAL_MS) return;
+        const record = makeResumeRecord();
+        if (!record) return;
+        const revision = resumeDocumentRevision;
+        lastProgressSaveAt = now;
+        lastProgressSavedIndex = currentIdx;
+        resumeWriteQueue = resumeWriteQueue.catch(() => {}).then(async () => {
+            if (revision !== resumeDocumentRevision || !resumeSavingEnabled) return;
+            await writeResumeRecord(record);
+            if (revision !== resumeDocumentRevision || !resumeSavingEnabled) return;
+            resumeStoredRecord = record;
+            resumeMessage('Zapamiętany dokument', record.name, record);
+        });
+        resumeWriteQueue.catch(() => {
+            if (revision === resumeDocumentRevision && resumeSavingEnabled)
+                resumeMessage('Postęp nie został zapisany', 'Brak miejsca lub niedostępna pamięć lokalna. Odtwarzanie działa dalej.');
+        });
+    }
+
+    function paintRestoredPosition(record) {
+        document.querySelectorAll('.sentence').forEach(el => el.classList.remove('active'));
+        if (!record.completed) {
+            const active = document.getElementById('sent-' + currentIdx);
+            if (active) active.classList.add('active');
+        }
+        document.getElementById('progressBar').style.width = (record.completed ? 100 :
+            (sentences.length ? ((currentIdx + 1) / sentences.length) * 100 : 0)) + '%';
+    }
+
+    async function restoreSavedDocument() {
+        const action = resumeUserAction;
+        const originalRevision = resumeDocumentRevision;
+        try {
+            const record = await readResumeRecord();
+            if (action !== resumeUserAction || originalRevision !== resumeDocumentRevision) return;
+            if (!record) {
+                resumeStoredRecord = null;
+                resumeMessage('Zapis lokalny', 'Brak zapamiętanego dokumentu.');
+                return;
+            }
+            const blocks = safeResumeBlocks(record.blocks, typeof record.text === 'string' ? record.text.length : -1);
+            if (!validResumeRecord(record) || !blocks || speechSegments(record.text, blocks).length !== record.sentenceCount) {
+                await eraseResumeRecord();
+                if (action === resumeUserAction && originalRevision === resumeDocumentRevision) {
+                    resumeStoredRecord = null;
+                    resumeMessage('Zapis lokalny', 'Nie udało się zweryfikować starego zapisu. Wczytaj dokument ponownie.');
+                }
+                return;
+            }
+            if (action !== resumeUserAction || originalRevision !== resumeDocumentRevision) return;
+            resumeStoredRecord = record;
+            document.getElementById('rawText').value = record.text;
+            renderSentences(record.text, blocks, {name: record.name, restored: true, index: record.index, completed: record.completed});
+            if (record.voice) document.getElementById('voiceSelect').value = record.voice;
+            document.getElementById('rateSlider').value = String(record.rate);
+            document.getElementById('rateLabel').innerText = (Number(record.rate) >= 0 ? '+' + record.rate : record.rate) + '%';
+            paintRestoredPosition(record);
+            setStatus(record.completed ? 'Dokument ukończony. Możesz zacząć od początku.' : 'Dokument przywrócony. Wybierz „Kontynuuj od tego miejsca”.');
+            resumeMessage('Zapamiętany dokument', record.name, record);
+        } catch (error) {
+            if (action === resumeUserAction && originalRevision === resumeDocumentRevision)
+                resumeMessage('Zapis lokalny niedostępny', 'Ten dokument nie zostanie zapamiętany. Odtwarzanie działa dalej.');
+        }
+    }
+
+    window.continueSavedDocument = function() {
+        const record = resumeStoredRecord;
+        if (!record || !currentDocument || currentDocument.text !== record.text) return;
+        currentDocument.completed = false;
+        window.startFrom(record.completed ? 0 : currentIdx);
+    };
+
+    window.deleteSavedDocument = function() {
+        resumeDocumentRevision++;
+        resumeSavingEnabled = false;
+        resumeStoredRecord = null;
+        const revision = resumeDocumentRevision;
+        resumeWriteQueue = resumeWriteQueue.catch(() => {}).then(async () => {
+            await eraseResumeRecord();
+            if (revision !== resumeDocumentRevision) return;
+            resumeMessage('Zapis usunięty', 'Treść dokumentu i zapamiętana pozycja zostały usunięte z tej przeglądarki.');
+        });
+        resumeWriteQueue.catch(() => {
+            if (revision === resumeDocumentRevision)
+                resumeMessage('Nie udało się usunąć zapisu', 'Pamięć lokalna jest niedostępna. Odtwarzanie działa dalej.');
+        });
+    };
 
     // Layout whitespace is retained for display; only the speech projection collapses it.
     function normalizeLayout(text) {
@@ -377,16 +621,26 @@ HTML_PAGE = """
 
     window.applyText = function() {
         const text = document.getElementById('rawText').value.trim();
-        renderSentences(text);
+        if (!text) return setStatus('Wklej tekst przed zatwierdzeniem.');
+        resumeUserAction++;
+        renderSentences(text, [], {name: 'Wklejony tekst'});
         window.switchTab('reader');
     };
 
-    function renderSentences(text, hints = []) {
+    function renderSentences(text, hints = [], options = {}) {
         window.stopReading();
+        if (!options.restored) resumeUserAction++;
+        resumeDocumentRevision++;
+        resumeSavingEnabled = true;
+        lastProgressSavedIndex = null;
+        lastProgressSaveAt = 0;
         const box = document.getElementById('readerView');
         box.innerHTML = '';
         const segments = speechSegments(text, hints);
         sentences = segments.map(segment => segment.text);
+        const blocks = safeResumeBlocks(hints, text.length);
+        currentDocument = {text, name: options.name || 'Dokument', blocks: blocks || [],
+            completed: !!options.completed};
 
         sentences.forEach((s, idx) => {
             const div = document.createElement('div');
@@ -396,14 +650,21 @@ HTML_PAGE = """
             div.onclick = () => window.startFrom(idx);
             box.appendChild(div);
         });
-        currentIdx = 0;
-        document.getElementById('progressBar').style.width = '0%';
-        setStatus(`Gotowy • Zdań: ${sentences.length}`);
+        currentIdx = options.restored ? options.index : 0;
+        if (options.restored) {
+            paintRestoredPosition({completed: !!options.completed});
+            resumeMessage('Zapamiętany dokument', currentDocument.name, resumeStoredRecord);
+        } else {
+            document.getElementById('progressBar').style.width = '0%';
+            setStatus(`Gotowy • Zdań: ${sentences.length}`);
+            if (sentences.length) saveResumeProgress(true);
+        }
     }
 
     document.getElementById('fileInput').addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
+        resumeUserAction++;
         setStatus(`⏳ Wysyłanie pliku (${file.name})...`);
         const formData = new FormData();
         formData.append('file', file);
@@ -415,12 +676,14 @@ HTML_PAGE = """
             if (data.error) throw new Error(data.error);
 
             document.getElementById('rawText').value = data.text;
-            renderSentences(data.text, data.blocks || []);
+            if (typeof data.text !== 'string' || !data.text.trim()) throw new Error('Plik nie zawiera tekstu do czytania.');
+            renderSentences(data.text, data.blocks || [], {name: file.name});
             window.switchTab('reader');
             setStatus(`✔️ Wczytano plik: ${file.name}`);
         } catch (err) {
             alert('Błąd wczytywania pliku: ' + err.message);
             setStatus('❌ Błąd odczytu pliku');
+            if (!currentDocument) restoreSavedDocument();
         }
     });
 
@@ -844,6 +1107,7 @@ HTML_PAGE = """
     function setCurrentSentenceVisual(idx, force = false) {
         if (idx < 0 || idx >= sentences.length || (idx === currentIdx && !force)) return;
         currentIdx = idx;
+        saveResumeProgress(true);
         document.querySelectorAll('.sentence').forEach(el => el.classList.remove('active'));
         const activeEl = document.getElementById('sent-' + idx);
         if (activeEl) {
@@ -857,6 +1121,14 @@ HTML_PAGE = """
     function nextSpeakableIndex(idx) {
         while (idx < sentences.length && !sentences[idx].trim()) idx++;
         return idx;
+    }
+
+    function completeCurrentDocument() {
+        if (!sentences.length) return;
+        if (currentDocument) currentDocument.completed = true;
+        currentIdx = sentences.length;
+        document.getElementById('progressBar').style.width = '100%';
+        if (currentDocument) saveResumeProgress(true);
     }
 
     function streamBufferedEnd(sourceBuffer) {
@@ -996,6 +1268,7 @@ HTML_PAGE = """
             diagnostics.stream.buffered_bytes = state.bufferedBytes;
             diagnostics.stream.buffered_seconds = Math.max(0, streamBufferedEnd(state.sourceBuffer) - time);
         }
+        saveResumeProgress(false);
         trimContinuousBuffer(state);
         pumpContinuous(state);
     }
@@ -1108,9 +1381,8 @@ HTML_PAGE = """
             state.player.onended = () => {
                 if (!streamStateIsCurrent(state)) return;
                 state.ended = true;
-                const last = state.appended[state.appended.length - 1];
-                if (last) setCurrentSentenceVisual(last.idx);
                 trace('stream_ended', {fragments: state.appended.length});
+                completeCurrentDocument();
                 window.stopReading();
                 setStatus('Zakończono czytanie');
             };
@@ -1210,6 +1482,7 @@ HTML_PAGE = """
             };
             player.onwaiting = () => { if (token === session && currentIdx === idx) trace('waiting'); };
             player.onstalled = () => { if (token === session && currentIdx === idx) trace('stalled'); };
+            player.ontimeupdate = () => { if (token === session && currentIdx === idx) saveResumeProgress(false); };
             ready = true;
             player.onended = () => {
                 if (token !== session || !isReading || currentIdx !== idx) return;
@@ -1223,6 +1496,13 @@ HTML_PAGE = """
                     visibility: document.visibilityState || 'unknown', buffer: bufferMode};
                 currentIdx++;
                 trimCache();
+                if (currentIdx >= sentences.length) {
+                    completeCurrentDocument();
+                    window.stopReading();
+                    setStatus('Zakończono czytanie');
+                    return;
+                }
+                saveResumeProgress(true);
                 if (!isPaused) playCurrent();
             };
             player.onerror = () => {
@@ -1236,6 +1516,8 @@ HTML_PAGE = """
     window.startFrom = function(idx) {
         window.stopReading();
         currentIdx = idx;
+        if (currentDocument) currentDocument.completed = false;
+        saveResumeProgress(true);
         isReading = true;
         setMediaPlaybackState('playing');
         document.getElementById('playBtn').innerText = '⏸';
@@ -1263,6 +1545,7 @@ HTML_PAGE = """
             trace("pause");
             setMediaPlaybackState('paused');
             audio.pause();
+            saveResumeProgress(true);
             document.getElementById('playBtn').innerText = '▶';
             setStatus('Wstrzymano');
         } else {
@@ -1285,6 +1568,7 @@ HTML_PAGE = """
     window.stopReading = function() {
         finishTransition('cancelled');
         trace('stop');
+        saveResumeProgress(true);
         const previousStream = continuousPlayback;
         continuousPlayback = null;
         if (previousStream) {
@@ -1343,6 +1627,14 @@ HTML_PAGE = """
     document.getElementById('rateSlider').addEventListener('change', settingsChanged);
 
     registerMediaSessionActions();
+
+    if (typeof window.addEventListener === 'function')
+        window.addEventListener('pagehide', () => saveResumeProgress(true));
+    if (typeof document.addEventListener === 'function')
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') saveResumeProgress(true);
+        });
+    restoreSavedDocument();
 
     if (testMode) {
         document.addEventListener('visibilitychange', () => {
