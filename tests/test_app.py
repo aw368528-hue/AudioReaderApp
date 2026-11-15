@@ -324,6 +324,18 @@ class ReaderTests(unittest.TestCase):
         self.assertIn('env(safe-area-inset-bottom)', page)
         self.assertIn('--ocr-viewport-height', page)
 
+    def test_ocr_multiscan_markup_and_local_script(self):
+        page = self.client.get('/').text
+        for control in ('chooseScanImport', 'scanImport', 'scanCameraInput', 'scanGalleryInput',
+                        'scanPages', 'scanCropSelection', 'scanAppliedPreview', 'scanRecognize',
+                        'scanCancel', 'scanEditorText', 'scanDocumentName', 'scanRead'):
+            self.assertIn(f'id="{control}"', page)
+        self.assertIn('id="scanGalleryInput" accept="image/jpeg,image/png,image/webp" multiple', page)
+        self.assertIn('Skanuj dokument', page)
+        script = self.client.get('/ocr-probe-assets/app-ocr.js').text
+        self.assertIn('createDocumentScanner', script)
+        self.assertIn("createWorker('pol'", script)
+
     def test_ui01_mobile_markup_and_responsive_contract(self):
         html = self.client.get('/').text
         self.assertIn('id="tabReader"', html)
