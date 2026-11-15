@@ -147,6 +147,23 @@ HTML_PAGE = """
         }
         .resume-actions button.primary { background: var(--primary); color: white; }
         .resume-actions button[hidden] { display: none; }
+        .history-toolbar, .history-nav, .history-entry, .library-entry { display: flex; align-items: center; gap: 8px; }
+        .history-toolbar, .history-nav { justify-content: space-between; }
+        .history-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+        .history-grid button, .history-nav button, .history-toolbar button, .history-entry button, .library-entry button {
+            min-height: 44px; border: 0; border-radius: 10px; padding: 8px; color: var(--text);
+            background: var(--surface-light); font: inherit; cursor: pointer;
+        }
+        .history-grid .history-weekday { min-height: auto; padding: 4px 0; background: transparent; color: var(--text-muted); font-size: .72rem; }
+        .history-grid button.has-sessions { outline: 2px solid var(--primary); }
+        .history-grid button.selected { background: var(--primary); color: white; }
+        .history-grid button.empty { visibility: hidden; }
+        .history-list, .library-list { display: flex; flex-direction: column; gap: 8px; }
+        .library-list[hidden], #calendarView[hidden] { display: none; }
+        .history-entry, .library-entry { justify-content: space-between; background: var(--bg); border-radius: 10px; padding: 8px; }
+        .history-entry > div, .library-entry > div { min-width: 0; overflow-wrap: anywhere; }
+        .history-entry button, .library-entry button { flex: 0 0 auto; }
+        .history-empty { color: var(--text-muted); text-align: center; padding: 20px 8px; }
         @media (max-width: 520px) {
             .resume-panel { align-items: flex-start; flex-direction: column; }
             .resume-actions { width: 100%; }
@@ -168,6 +185,7 @@ HTML_PAGE = """
     <div class="tabs">
         <button class="tab-btn active" id="tabReader" onclick="window.switchTab('reader')">🎧 Lektor</button>
         <button class="tab-btn" id="tabEditor" onclick="window.switchTab('editor')">📝 Wklej tekst</button>
+        <button class="tab-btn" id="tabHistory" onclick="window.switchTab('history')">📅 Historia</button>
     </div>
 
     <section class="resume-panel" id="resumePanel" aria-live="polite">
@@ -191,6 +209,17 @@ HTML_PAGE = """
     <div class="view-box" id="editorView" style="display:none;">
         <textarea id="rawText" placeholder="Wklej tutaj dowolny tekst do przeczytania..."></textarea>
         <button class="apply-btn" onclick="window.applyText()">✔️ Zatwierdź tekst</button>
+    </div>
+
+    <div class="view-box" id="historyView" style="display:none;">
+        <div class="history-toolbar"><strong>Historia odsłuchów</strong><button id="libraryToggle" onclick="window.toggleLibraryView()">📚 Biblioteka</button></div>
+        <div id="calendarView">
+            <div class="history-nav"><button id="historyPrev" aria-label="Poprzedni miesiąc">‹</button><strong id="historyMonth"></strong><button id="historyNext" aria-label="Następny miesiąc">›</button></div>
+            <div class="history-grid" id="historyGrid"></div>
+            <div class="history-list" id="historyList"></div>
+        </div>
+        <div class="library-list" id="libraryList" hidden></div>
+        <small class="resume-note">Biblioteka mieści do 10 dokumentów. Historia obejmuje rzeczywiste sesje odtwarzania w tej przeglądarce.</small>
     </div>
 
     <div class="player-card">
@@ -233,9 +262,14 @@ HTML_PAGE = """
     let ttsNotBefore = 0;
     let ttsAttempt = 1;
     const RESUME_DB_NAME = 'AudioReaderAI';
-    const RESUME_DB_VERSION = 1;
+    const RESUME_DB_VERSION = 2;
     const RESUME_STORE = 'documents';
+    const SESSION_STORE = 'sessions';
     const RESUME_KEY = 'last';
+    const MAX_LIBRARY_DOCUMENTS = 10;
+    const MAX_HISTORY_SESSIONS = 500;
+    const HISTORY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+    const SESSION_GROUP_MS = 30 * 60 * 1000;
     const SEGMENTATION_VERSION = 1;
     const RESUME_SAVE_INTERVAL_MS = 10000;
     let resumeDbPromise = null;
@@ -245,9 +279,18 @@ HTML_PAGE = """
     let lastProgressSaveAt = 0;
     let lastProgressSavedIndex = null;
     let resumeWriteSequence = 0;
+    let lastDocumentUseStamp = 0;
     let resumeStoredRecord = null;
     let currentDocument = null;
     let resumeSavingEnabled = true;
+    const deletedDocumentIds = new Set();
+    let activeListeningSession = null;
+    let historyMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    let selectedHistoryDay = dateKey(new Date());
+    let showingLibrary = false;
+    let activeTab = 'reader';
+    let historyDocuments = [];
+    let historySessions = [];
 
     function resumeMessage(title, detail, record = null) {
         const panel = document.getElementById('resumePanel');
@@ -269,9 +312,30 @@ HTML_PAGE = """
             let request;
             try { request = window.indexedDB.open(RESUME_DB_NAME, RESUME_DB_VERSION); }
             catch (error) { reject(error); return; }
-            request.onupgradeneeded = () => {
+            request.onupgradeneeded = event => {
                 const db = request.result;
-                if (!db.objectStoreNames.contains(RESUME_STORE)) db.createObjectStore(RESUME_STORE, {keyPath: 'id'});
+                const upgrade = request.transaction;
+                let documents;
+                if (!db.objectStoreNames.contains(RESUME_STORE)) documents = db.createObjectStore(RESUME_STORE, {keyPath: 'id'});
+                else documents = upgrade.objectStore(RESUME_STORE);
+                if (!documents.indexNames.contains('lastUsedAt')) documents.createIndex('lastUsedAt', 'lastUsedAt');
+                let sessions;
+                if (!db.objectStoreNames.contains(SESSION_STORE)) sessions = db.createObjectStore(SESSION_STORE, {keyPath: 'id'});
+                else sessions = upgrade.objectStore(SESSION_STORE);
+                if (!sessions.indexNames.contains('documentId')) sessions.createIndex('documentId', 'documentId');
+                if (!sessions.indexNames.contains('startedAt')) sessions.createIndex('startedAt', 'startedAt');
+                if (event.oldVersion === 1) {
+                    const legacy = documents.get(RESUME_KEY);
+                    legacy.onsuccess = () => {
+                        if (!legacy.result) return;
+                        const old = legacy.result;
+                        const migrated = {...old, id: 'doc_migrated_v1_last', version: 1,
+                            createdAt: Number(old.savedAt) || Date.now(), lastUsedAt: Number(old.savedAt) || Date.now(),
+                            migratedFrom: 'ux01-v1'};
+                        const put = documents.put(migrated);
+                        put.onsuccess = () => documents.delete(RESUME_KEY);
+                    };
+                }
             };
             request.onsuccess = () => resolve(request.result);
             request.onerror = () => reject(request.error || new Error('indexeddb_open_failed'));
@@ -284,25 +348,282 @@ HTML_PAGE = """
         const db = await openResumeDatabase();
         return new Promise((resolve, reject) => {
             let request;
-            try { request = db.transaction(RESUME_STORE, 'readonly').objectStore(RESUME_STORE).get(RESUME_KEY); }
+            try { request = db.transaction(RESUME_STORE, 'readonly').objectStore(RESUME_STORE).getAll(); }
+            catch (error) { reject(error); return; }
+            request.onsuccess = () => {
+                const documents=(request.result || []).filter(item=>item.id!==RESUME_KEY);
+                const valid=documents.filter(item=>validResumeRecord(item) &&
+                    speechSegments(item.text,item.blocks).length===item.sentenceCount);
+                documents.filter(item=>!valid.includes(item)).forEach(item=>queueInvalidResumeCleanup(item,resumeUserAction,resumeDocumentRevision));
+                resolve(valid.sort((a,b) => (Number(b.lastUsedAt) || Number(b.savedAt) || 0) -
+                    (Number(a.lastUsedAt) || Number(a.savedAt) || 0))[0] || null);
+            };
+            request.onerror = () => reject(request.error || new Error('indexeddb_read_failed'));
+        });
+    }
+
+    async function readAllRecords(storeName) {
+        const db = await openResumeDatabase();
+        return new Promise((resolve, reject) => {
+            let request;
+            try { request = db.transaction(storeName, 'readonly').objectStore(storeName).getAll(); }
+            catch (error) { reject(error); return; }
+            request.onsuccess = () => resolve(request.result || []);
+            request.onerror = () => reject(request.error || new Error('indexeddb_read_failed'));
+        });
+    }
+
+    function makeDocumentId() {
+        return `doc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 11)}`;
+    }
+
+    async function readDocumentById(id) {
+        const db = await openResumeDatabase();
+        return new Promise((resolve, reject) => {
+            let request;
+            try { request = db.transaction(RESUME_STORE, 'readonly').objectStore(RESUME_STORE).get(id); }
             catch (error) { reject(error); return; }
             request.onsuccess = () => resolve(request.result || null);
             request.onerror = () => reject(request.error || new Error('indexeddb_read_failed'));
         });
     }
 
+    function writeSessionRecord(record) {
+        resumeWriteQueue = resumeWriteQueue.catch(() => {}).then(async () => {
+            const db = await openResumeDatabase();
+            await new Promise((resolve, reject) => {
+                let tx;
+                try { tx = db.transaction([RESUME_STORE, SESSION_STORE], 'readwrite'); }
+                catch (error) { reject(error); return; }
+                tx.oncomplete = resolve;
+                tx.onerror = tx.onabort = () => reject(tx.error || new Error('indexeddb_session_write_failed'));
+                const exists=tx.objectStore(RESUME_STORE).get(record.documentId);
+                exists.onsuccess=()=>{ if (exists.result) tx.objectStore(SESSION_STORE).put(record); };
+                exists.onerror=()=>reject(exists.error||new Error('indexeddb_session_write_failed'));
+            });
+            await pruneHistory();
+            if (activeTab === 'history') refreshHistory().catch(() => {});
+        });
+        resumeWriteQueue.catch(() => {});
+        return resumeWriteQueue;
+    }
+
+    async function pruneHistory() {
+        const sessions = await readAllRecords(SESSION_STORE);
+        const cutoff = Date.now() - HISTORY_RETENTION_MS;
+        const ordered = sessions.sort((a,b) => a.startedAt - b.startedAt);
+        const remove = ordered.filter(item => item.startedAt < cutoff).concat(ordered.slice(0, Math.max(0, ordered.length - MAX_HISTORY_SESSIONS)));
+        const ids = new Set(remove.map(item => item.id));
+        if (!ids.size) return;
+        const db = await openResumeDatabase();
+        await new Promise((resolve, reject) => {
+            let tx;
+            try { tx = db.transaction(SESSION_STORE, 'readwrite'); }
+            catch (error) { reject(error); return; }
+            tx.oncomplete = resolve;
+            tx.onerror = tx.onabort = () => reject(tx.error || new Error('indexeddb_prune_failed'));
+            ids.forEach(id => tx.objectStore(SESSION_STORE).delete(id));
+        });
+    }
+
+    function persistListeningSession() {
+        if (!activeListeningSession) return;
+        const item = {...activeListeningSession};
+        writeSessionRecord(item);
+    }
+
+    function beginListeningSession() {
+        if (!currentDocument?.id) return;
+        const now = Date.now();
+        if (activeListeningSession?.documentId === currentDocument.id) {
+            if (activeListeningSession.status === 'playing') return;
+            if (now - activeListeningSession.lastResumedAt <= SESSION_GROUP_MS) {
+                activeListeningSession.status = 'playing';
+                activeListeningSession.lastResumedAt = now;
+                activeListeningSession.voice = document.getElementById('voiceSelect').value;
+                activeListeningSession.rate = String(document.getElementById('rateSlider').value);
+                persistListeningSession();
+                return;
+            }
+            finishListeningSession('interrupted');
+        } else if (activeListeningSession) finishListeningSession('interrupted');
+        activeListeningSession = {id: `listen_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
+            documentId: currentDocument.id, documentName: currentDocument.name, startedAt: now,
+            lastResumedAt: now, playedMs: 0, status: 'playing', voice: document.getElementById('voiceSelect').value,
+            rate: String(document.getElementById('rateSlider').value), updatedAt: now};
+        persistListeningSession();
+    }
+
+    function pauseListeningSession() {
+        if (!activeListeningSession || activeListeningSession.status !== 'playing') return;
+        const now = Date.now();
+        activeListeningSession.playedMs += Math.max(0, now - activeListeningSession.lastResumedAt);
+        activeListeningSession.lastResumedAt = now;
+        activeListeningSession.status = 'paused';
+        activeListeningSession.updatedAt = now;
+        persistListeningSession();
+    }
+
+    function finishListeningSession(status) {
+        if (!activeListeningSession) return;
+        if (activeListeningSession.status === 'playing')
+            activeListeningSession.playedMs += Math.max(0, Date.now() - activeListeningSession.lastResumedAt);
+        const item = {...activeListeningSession, status, endedAt: Date.now(), updatedAt: Date.now()};
+        activeListeningSession = null;
+        writeSessionRecord(item);
+    }
+
+    function dateKey(date) {
+        const d = date instanceof Date ? date : new Date(date);
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+
+    function formatLocalDate(key) {
+        const [year, month, day] = key.split('-').map(Number);
+        return new Intl.DateTimeFormat('pl-PL', {weekday:'long', day:'numeric', month:'long', year:'numeric'})
+            .format(new Date(year, month - 1, day));
+    }
+
+    async function refreshHistory() {
+        try {
+            const [docs, sessions] = await Promise.all([readAllRecords(RESUME_STORE), readAllRecords(SESSION_STORE)]);
+            historyDocuments = docs.filter(item => item.id !== RESUME_KEY && validResumeRecord(item))
+                .sort((a,b) => (Number(b.lastUsedAt) || Number(b.savedAt) || 0) - (Number(a.lastUsedAt) || Number(a.savedAt) || 0));
+            historySessions = sessions.filter(item => Number.isFinite(item.startedAt) && typeof item.documentId === 'string');
+            renderHistory();
+        } catch { /* Storage failure must not affect playback. */ }
+    }
+
+    function renderHistory() {
+        const grid = document.getElementById('historyGrid');
+        if (!grid) return;
+        const monthName = new Intl.DateTimeFormat('pl-PL', {month:'long', year:'numeric'}).format(historyMonth);
+        document.getElementById('historyMonth').textContent = monthName;
+        grid.innerHTML = '';
+        const weekdays = ['Pn','Wt','Śr','Cz','Pt','So','Nd'];
+        weekdays.forEach(label => { const el=document.createElement('div'); el.className='history-weekday'; el.innerText=label; grid.appendChild(el); });
+        const first = new Date(historyMonth.getFullYear(), historyMonth.getMonth(), 1);
+        const offset = (first.getDay() + 6) % 7;
+        const days = new Date(historyMonth.getFullYear(), historyMonth.getMonth()+1, 0).getDate();
+        const activeDates = new Set(historySessions.map(item => dateKey(item.startedAt)));
+        for (let i=0;i<offset;i++) { const spacer=document.createElement('div'); spacer.className='empty'; grid.appendChild(spacer); }
+        for (let day=1;day<=days;day++) {
+            const date=new Date(historyMonth.getFullYear(),historyMonth.getMonth(),day), key=dateKey(date);
+            const button=document.createElement('button'); button.innerText=String(day);
+            if (activeDates.has(key)) button.classList.add('has-sessions');
+            if (selectedHistoryDay===key) button.classList.add('selected');
+            button.setAttribute?.('aria-label', `${day} ${monthName}${activeDates.has(key) ? ', sesja odsłuchu' : ''}`);
+            button.onclick=()=>{ selectedHistoryDay=key; renderHistory(); };
+            grid.appendChild(button);
+        }
+        const list=document.getElementById('historyList'); list.innerHTML='';
+        const entries=historySessions.filter(item=>dateKey(item.startedAt)===selectedHistoryDay).sort((a,b)=>a.startedAt-b.startedAt);
+        if (!entries.length) { const empty=document.createElement('div'); empty.className='history-empty'; empty.innerText='Brak sesji odsłuchu tego dnia.'; list.appendChild(empty); return; }
+        entries.forEach(item=>{
+            const row=document.createElement('div'); row.className='history-entry';
+            const copy=document.createElement('div');
+            const time=new Intl.DateTimeFormat('pl-PL',{hour:'2-digit',minute:'2-digit'}).format(new Date(item.startedAt));
+            const statusLabels={playing:'Odtwarzanie',paused:'Wstrzymana',stopped:'Zatrzymana',completed:'Ukończona',interrupted:'Przerwana'};
+            copy.innerText=`${time} • ${item.documentName || historyDocuments.find(d=>d.id===item.documentId)?.name || 'Dokument usunięty'}${item.voice ? ' • '+item.voice.replace('pl-PL-','') : ''} • ${statusLabels[item.status] || item.status}`;
+            row.appendChild(copy);
+            const doc=historyDocuments.find(d=>d.id===item.documentId);
+            if (doc) { const button=document.createElement('button'); button.innerText=doc.completed?'Powtórz':'Otwórz'; button.onclick=()=>openLibraryDocument(doc.id); row.appendChild(button); }
+            list.appendChild(row);
+        });
+    }
+
+    async function renderLibrary() {
+        await refreshHistory();
+        const list=document.getElementById('libraryList'); list.innerHTML='';
+        if (!historyDocuments.length) { const empty=document.createElement('div'); empty.className='history-empty'; empty.innerText='Biblioteka jest pusta. Wklej tekst lub wgraj dokument.'; list.appendChild(empty); return; }
+        historyDocuments.forEach(record=>{
+            const row=document.createElement('div'); row.className='library-entry';
+            const copy=document.createElement('div'); copy.innerText=`${record.name} • ${record.completed?'Ukończony':`zdanie ${Math.min(record.index+1,record.sentenceCount)} z ${record.sentenceCount}`}`;
+            row.appendChild(copy);
+            const open=document.createElement('button'); open.innerText='Otwórz'; open.onclick=()=>openLibraryDocument(record.id); row.appendChild(open);
+            const remove=document.createElement('button'); remove.innerText='Usuń'; remove.setAttribute?.('aria-label',`Usuń ${record.name}`); remove.onclick=()=>deleteLibraryDocument(record.id); row.appendChild(remove);
+            list.appendChild(row);
+        });
+    }
+
+    async function openLibraryDocument(id) {
+        try {
+            const record=await readDocumentById(id);
+            if (!record || !validResumeRecord(record)) return;
+            resumeUserAction++;
+            resumeStoredRecord=record;
+            document.getElementById('rawText').value=record.text;
+            if (record.voice) document.getElementById('voiceSelect').value=record.voice;
+            document.getElementById('rateSlider').value=String(record.rate);
+            document.getElementById('rateLabel').innerText=(Number(record.rate)>=0?'+':'')+record.rate+'%';
+            lastDocumentUseStamp = Math.max(lastDocumentUseStamp, Number(record.lastUsedAt) || 0);
+            renderSentences(record.text,record.blocks,{name:record.name,restored:true,id:record.id,index:record.index,completed:record.completed,createdAt:record.createdAt,lastUsedAt:record.lastUsedAt});
+            saveResumeProgress(true);
+            window.switchTab('reader');
+            setStatus(record.completed?'Dokument ukończony. Możesz zacząć od początku.':'Dokument przywrócony. Wybierz ▶, aby kontynuować.');
+        } catch {}
+    }
+
+    async function deleteLibraryDocument(id) {
+        const wasCurrent=currentDocument?.id===id;
+        if (wasCurrent) { finishListeningSession('stopped'); window.stopReading(); }
+        deletedDocumentIds.add(id);
+        if (wasCurrent) resumeDocumentRevision++;
+        resumeWriteQueue=resumeWriteQueue.catch(()=>{}).then(async()=>{
+            const db=await openResumeDatabase();
+            await new Promise((resolve,reject)=>{
+                const tx=db.transaction([RESUME_STORE,SESSION_STORE],'readwrite');
+                tx.oncomplete=resolve; tx.onerror=tx.onabort=()=>reject(tx.error||new Error('indexeddb_delete_failed'));
+                tx.objectStore(RESUME_STORE).delete(id);
+                const all=tx.objectStore(SESSION_STORE).getAll();
+                all.onsuccess=()=> (all.result||[]).filter(item=>item.documentId===id).forEach(item=>tx.objectStore(SESSION_STORE).delete(item.id));
+            });
+            if (wasCurrent) { currentDocument=null; sentences=[]; document.getElementById('readerView').innerHTML=''; resumeMessage('Dokument usunięty','Treść, postęp i historia dokumentu zostały usunięte z tej przeglądarki.'); }
+            await renderLibrary();
+        }).catch(()=>resumeMessage('Nie udało się usunąć dokumentu','Pamięć lokalna jest niedostępna.'));
+        return resumeWriteQueue;
+    }
+
+    window.toggleLibraryView = function() {
+        showingLibrary=!showingLibrary;
+        document.getElementById('calendarView').hidden=showingLibrary;
+        document.getElementById('libraryList').hidden=!showingLibrary;
+        document.getElementById('libraryToggle').textContent=showingLibrary?'📅 Kalendarz':'📚 Biblioteka';
+        if (showingLibrary) renderLibrary(); else refreshHistory();
+    };
+
+    document.getElementById('historyPrev').addEventListener('click',()=>{historyMonth=new Date(historyMonth.getFullYear(),historyMonth.getMonth()-1,1);selectedHistoryDay=dateKey(historyMonth);renderHistory();});
+    document.getElementById('historyNext').addEventListener('click',()=>{historyMonth=new Date(historyMonth.getFullYear(),historyMonth.getMonth()+1,1);selectedHistoryDay=dateKey(historyMonth);renderHistory();});
+
     async function writeResumeRecord(record) {
         const db = await openResumeDatabase();
-        return new Promise((resolve, reject) => {
+        let rotated = null;
+        await new Promise((resolve, reject) => {
             let transaction;
             try {
-                transaction = db.transaction(RESUME_STORE, 'readwrite');
-                transaction.objectStore(RESUME_STORE).put(record);
+                transaction = db.transaction([RESUME_STORE, SESSION_STORE], 'readwrite');
             } catch (error) { reject(error); return; }
             transaction.oncomplete = () => resolve();
             transaction.onerror = () => reject(transaction.error || new Error('indexeddb_write_failed'));
             transaction.onabort = () => reject(transaction.error || new Error('indexeddb_write_failed'));
+            const documents = transaction.objectStore(RESUME_STORE);
+            const existing = documents.getAll();
+            existing.onsuccess = () => {
+                const library = (existing.result || []).filter(item => item.id !== RESUME_KEY);
+                if (!library.some(item => item.id === record.id) && library.length >= MAX_LIBRARY_DOCUMENTS) {
+                    rotated = library.filter(item => item.id !== currentDocument?.id)
+                        .sort((a,b) => (Number(a.lastUsedAt) || Number(a.savedAt) || 0) - (Number(b.lastUsedAt) || Number(b.savedAt) || 0))[0];
+                    if (!rotated) { reject(new Error('library_full_active_document_protected')); return; }
+                    documents.delete(rotated.id);
+                    const sessions = transaction.objectStore(SESSION_STORE).getAll();
+                    sessions.onsuccess = () => (sessions.result || []).filter(item => item.documentId === rotated.id)
+                        .forEach(item => transaction.objectStore(SESSION_STORE).delete(item.id));
+                }
+                documents.put(record);
+            };
+            existing.onerror = () => reject(existing.error || new Error('indexeddb_read_failed'));
         });
+        return rotated;
     }
 
     function sameResumeRecord(left, right) {
@@ -320,7 +641,7 @@ HTML_PAGE = """
         return new Promise((resolve, reject) => {
             let transaction;
             try {
-                transaction = db.transaction(RESUME_STORE, 'readwrite');
+                transaction = db.transaction([RESUME_STORE, SESSION_STORE], 'readwrite');
             } catch (error) { reject(error); return; }
             let removed = false;
             transaction.oncomplete = () => resolve(removed);
@@ -329,13 +650,18 @@ HTML_PAGE = """
             try {
                 const store = transaction.objectStore(RESUME_STORE);
                 if (!expectedRecord) {
-                    store.delete(RESUME_KEY);
+                    if (currentDocument?.id) {
+                        store.delete(currentDocument.id);
+                        const sessions = transaction.objectStore(SESSION_STORE).getAll();
+                        sessions.onsuccess = () => (sessions.result || []).filter(item => item.documentId === currentDocument.id)
+                            .forEach(item => transaction.objectStore(SESSION_STORE).delete(item.id));
+                    }
                     removed = true;
                 } else {
-                    const request = store.get(RESUME_KEY);
+                    const request = store.get(expectedRecord.id);
                     request.onsuccess = () => {
                         if (!stillCurrent() || !sameResumeRecord(request.result, expectedRecord)) return;
-                        store.delete(RESUME_KEY);
+                        store.delete(expectedRecord.id);
                         removed = true;
                     };
                     request.onerror = () => reject(request.error || new Error('indexeddb_delete_failed'));
@@ -346,9 +672,9 @@ HTML_PAGE = """
 
     function queueInvalidResumeCleanup(expectedRecord, action, revision) {
         resumeWriteQueue = resumeWriteQueue.catch(() => {}).then(() => {
-            if (action !== resumeUserAction || revision !== resumeDocumentRevision) return false;
-            return eraseResumeRecord(expectedRecord,
-                () => action === resumeUserAction && revision === resumeDocumentRevision);
+            // Document IDs are immutable and cleanup rechecks the exact record in its write transaction.
+            // A new document has another ID, so a changed UI revision must not strand invalid migrated data.
+            return eraseResumeRecord(expectedRecord, () => true);
         });
         return resumeWriteQueue;
     }
@@ -363,7 +689,7 @@ HTML_PAGE = """
     }
 
     function validResumeRecord(record) {
-        if (!record || record.id !== RESUME_KEY || record.version !== RESUME_DB_VERSION ||
+        if (!record || typeof record.id !== 'string' || !record.id || record.id === RESUME_KEY || record.version !== 1 ||
             record.segmentationVersion !== SEGMENTATION_VERSION || typeof record.text !== 'string' ||
             !record.text.trim() || typeof record.name !== 'string' || !Array.isArray(record.blocks) ||
             !Number.isInteger(record.sentenceCount) || !Number.isInteger(record.index) ||
@@ -379,12 +705,16 @@ HTML_PAGE = """
         if (!currentDocument) return null;
         const blocks = safeResumeBlocks(currentDocument.blocks, currentDocument.text.length);
         if (!blocks) return null;
-        return {id: RESUME_KEY, version: RESUME_DB_VERSION, segmentationVersion: SEGMENTATION_VERSION,
+        const now = Date.now();
+        lastDocumentUseStamp = Math.max(now, lastDocumentUseStamp + 1, Number(currentDocument.lastUsedAt) || 0);
+        currentDocument.lastUsedAt = lastDocumentUseStamp;
+        return {id: currentDocument.id || makeDocumentId(), version: 1, segmentationVersion: SEGMENTATION_VERSION,
             text: currentDocument.text, name: currentDocument.name, blocks, sentenceCount: sentences.length,
             index: currentDocument.completed ? sentences.length : Math.max(0, Math.min(currentIdx, Math.max(0, sentences.length - 1))),
             completed: !!currentDocument.completed,
             voice: document.getElementById('voiceSelect').value,
-            rate: String(document.getElementById('rateSlider').value), savedAt: Date.now(),
+            rate: String(document.getElementById('rateSlider').value), savedAt: now,
+            createdAt: currentDocument.createdAt || now, lastUsedAt: lastDocumentUseStamp,
             writeToken: `${Date.now()}-${++resumeWriteSequence}-${Math.random().toString(36).slice(2)}`};
     }
 
@@ -398,11 +728,16 @@ HTML_PAGE = """
         lastProgressSaveAt = now;
         lastProgressSavedIndex = currentIdx;
         resumeWriteQueue = resumeWriteQueue.catch(() => {}).then(async () => {
-            if (revision !== resumeDocumentRevision || !resumeSavingEnabled) return;
-            await writeResumeRecord(record);
-            if (revision !== resumeDocumentRevision || !resumeSavingEnabled) return;
+            if (!resumeSavingEnabled || deletedDocumentIds.has(record.id)) return;
+            const rotated = await writeResumeRecord(record);
+            if (deletedDocumentIds.has(record.id)) return;
             resumeStoredRecord = record;
-            resumeMessage('Zapamiętany dokument', record.name, record);
+            if (revision === resumeDocumentRevision) {
+                resumeMessage(rotated ? 'Biblioteka pełna' : 'Zapis lokalny', rotated
+                    ? `Usunięto najdawniej używany dokument „${rotated.name}” i jego historię. Aktualny dokument pozostaje zapisany.`
+                    : `${record.name} • Dokument jest zapisany lokalnie (limit biblioteki: 10).`, record);
+            }
+            refreshHistory().catch(() => {});
         });
         resumeWriteQueue.catch(() => {
             if (revision === resumeDocumentRevision && resumeSavingEnabled)
@@ -443,13 +778,16 @@ HTML_PAGE = """
             if (action !== resumeUserAction || originalRevision !== resumeDocumentRevision) return;
             resumeStoredRecord = record;
             document.getElementById('rawText').value = record.text;
-            renderSentences(record.text, blocks, {name: record.name, restored: true, index: record.index, completed: record.completed});
+            lastDocumentUseStamp = Math.max(lastDocumentUseStamp, Number(record.lastUsedAt) || 0);
+            renderSentences(record.text, blocks, {name: record.name, restored: true, id: record.id,
+                createdAt: record.createdAt, lastUsedAt: record.lastUsedAt, index: record.index, completed: record.completed});
             if (record.voice) document.getElementById('voiceSelect').value = record.voice;
             document.getElementById('rateSlider').value = String(record.rate);
             document.getElementById('rateLabel').innerText = (Number(record.rate) >= 0 ? '+' + record.rate : record.rate) + '%';
             paintRestoredPosition(record);
             setStatus(record.completed ? 'Dokument ukończony. Możesz zacząć od początku.' : 'Dokument przywrócony. Wybierz „Kontynuuj od tego miejsca”.');
-            resumeMessage('Zapamiętany dokument', record.name, record);
+            resumeMessage('Biblioteka lokalna', record.name, record);
+            refreshHistory().catch(() => {});
         } catch (error) {
             if (action === resumeUserAction && originalRevision === resumeDocumentRevision)
                 resumeMessage('Zapis lokalny niedostępny', 'Ten dokument nie zostanie zapamiętany. Odtwarzanie działa dalej.');
@@ -464,19 +802,7 @@ HTML_PAGE = """
     };
 
     window.deleteSavedDocument = function() {
-        resumeDocumentRevision++;
-        resumeSavingEnabled = false;
-        resumeStoredRecord = null;
-        const revision = resumeDocumentRevision;
-        resumeWriteQueue = resumeWriteQueue.catch(() => {}).then(async () => {
-            await eraseResumeRecord();
-            if (revision !== resumeDocumentRevision) return;
-            resumeMessage('Zapis usunięty', 'Treść dokumentu i zapamiętana pozycja zostały usunięte z tej przeglądarki.');
-        });
-        resumeWriteQueue.catch(() => {
-            if (revision === resumeDocumentRevision)
-                resumeMessage('Nie udało się usunąć zapisu', 'Pamięć lokalna jest niedostępna. Odtwarzanie działa dalej.');
-        });
+        if (currentDocument?.id) deleteLibraryDocument(currentDocument.id);
     };
 
     // Layout whitespace is retained for display; only the speech projection collapses it.
@@ -649,10 +975,14 @@ HTML_PAGE = """
     }
 
     window.switchTab = function(tab) {
+        activeTab = tab;
         document.getElementById('readerView').style.display = tab === 'reader' ? 'flex' : 'none';
         document.getElementById('editorView').style.display = tab === 'editor' ? 'flex' : 'none';
+        document.getElementById('historyView').style.display = tab === 'history' ? 'flex' : 'none';
         document.getElementById('tabReader').classList.toggle('active', tab === 'reader');
         document.getElementById('tabEditor').classList.toggle('active', tab === 'editor');
+        document.getElementById('tabHistory').classList.toggle('active', tab === 'history');
+        if (tab === 'history') refreshHistory();
     };
 
     window.applyText = function() {
@@ -675,8 +1005,8 @@ HTML_PAGE = """
         const segments = speechSegments(text, hints);
         sentences = segments.map(segment => segment.text);
         const blocks = safeResumeBlocks(hints, text.length);
-        currentDocument = {text, name: options.name || 'Dokument', blocks: blocks || [],
-            completed: !!options.completed};
+        currentDocument = {id: options.id || makeDocumentId(), createdAt: options.createdAt || Date.now(), lastUsedAt: options.lastUsedAt || 0,
+            text, name: options.name || 'Dokument', blocks: blocks || [], completed: !!options.completed};
 
         sentences.forEach((s, idx) => {
             const div = document.createElement('div');
@@ -690,6 +1020,7 @@ HTML_PAGE = """
         if (options.restored) {
             paintRestoredPosition({completed: !!options.completed});
             resumeMessage('Zapamiętany dokument', currentDocument.name, resumeStoredRecord);
+            refreshHistory().catch(() => {});
         } else {
             document.getElementById('progressBar').style.width = '0%';
             setStatus(`Gotowy • Zdań: ${sentences.length}`);
@@ -828,7 +1159,12 @@ HTML_PAGE = """
 
     function observePlaybackPause(player) {
         if (typeof player.addEventListener !== 'function') return;
+        player.addEventListener('playing', () => {
+            beginListeningSession();
+            setMediaPlaybackState('playing');
+        });
         player.addEventListener('pause', () => {
+            pauseListeningSession();
             handleUnexpectedPause(player);
             if (diagnostics) trace('media_event', {media_event: 'pause', player: playerSnapshot(player)});
         });
@@ -1605,6 +1941,7 @@ HTML_PAGE = """
         finishTransition('cancelled');
         trace('stop');
         saveResumeProgress(true);
+        finishListeningSession(currentDocument?.completed ? 'completed' : 'stopped');
         const previousStream = continuousPlayback;
         continuousPlayback = null;
         if (previousStream) {
@@ -1665,7 +2002,7 @@ HTML_PAGE = """
     registerMediaSessionActions();
 
     if (typeof window.addEventListener === 'function')
-        window.addEventListener('pagehide', () => saveResumeProgress(true));
+        window.addEventListener('pagehide', () => { saveResumeProgress(true); finishListeningSession('interrupted'); });
     if (typeof document.addEventListener === 'function')
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'hidden') saveResumeProgress(true);
