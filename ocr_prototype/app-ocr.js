@@ -37,7 +37,41 @@
     let cropRect = fullCrop();
     let appliedCrop = null;
     let cropDirty = false;
+    let cropMode = 'editing';
     let cropDrag = null;
+    let recognizedText = '';
+
+    const isFullCrop = rect => rect.x === 0 && rect.y === 0 && rect.w === 1 && rect.h === 1;
+
+    function updateCropControls() {
+        const applied = cropMode === 'applied';
+        document.getElementById('ocrCropSurface').classList.toggle('is-applied', applied);
+        document.getElementById('ocrPreview').hidden = !ocrImageReady || applied;
+        document.getElementById('ocrAppliedPreview').hidden = !ocrImageReady || !applied;
+        document.getElementById('ocrCropSelection').hidden = !ocrImageReady || applied;
+        document.getElementById('ocrApplyCrop').hidden = applied;
+        document.getElementById('ocrApplyCrop').disabled = !ocrImageReady || ocrBusy;
+        document.getElementById('ocrChangeCrop').hidden = !applied;
+        document.getElementById('ocrChangeCrop').disabled = !ocrImageReady || ocrBusy;
+        document.getElementById('ocrResetCrop').disabled = !ocrImageReady || ocrBusy;
+        document.getElementById('ocrCropHint').hidden = !ocrImageReady || applied;
+        const title = document.getElementById('ocrCropTitle');
+        title.textContent = applied ? 'Kadr gotowy ✓' : 'Przytnij zdjęcie (opcjonalnie)';
+        title.classList.toggle('is-applied', applied);
+        document.getElementById('ocrRun').textContent = applied ? 'Rozpoznaj zaznaczony tekst' : 'Rozpoznaj tekst';
+        document.getElementById('ocrRun').disabled = !ocrImageReady || ocrBusy || cropDirty || (!applied && !isFullCrop(cropRect));
+    }
+
+    function confirmDiscardEdits() {
+        return !ocrResultReady || document.getElementById('ocrText').value === recognizedText ||
+            window.confirm('Zmiana kadru lub ponowne rozpoznawanie usunie poprawki tekstu. Kontynuować?');
+    }
+
+    function clearAppliedPreview() {
+        const preview = document.getElementById('ocrAppliedPreview');
+        preview.width = preview.height = 0;
+        preview.style.setProperty('--ocr-applied-min-width', '0px');
+    }
 
     function setOcrStatus(message, progress = null) {
         document.getElementById('ocrStatus').textContent = message;
@@ -56,6 +90,7 @@
     function invalidateOcrResult() {
         if (ocrBusy) cancelOcrRecognition();
         ocrResultReady = false;
+        recognizedText = '';
         document.getElementById('ocrText').value = '';
         document.getElementById('ocrText').hidden = true;
         document.getElementById('ocrTextLabel').hidden = true;
@@ -95,31 +130,51 @@
     };
 
     window.applyOcrCrop = function() {
-        if (!ocrImageReady) return;
+        if (!ocrImageReady || ocrBusy || cropMode === 'applied') return;
         appliedCrop = {...cropRect};
         cropDirty = false;
-        document.getElementById('ocrRun').disabled = ocrBusy;
-        setOcrStatus('Kadr zastosowany. Uruchom rozpoznawanie.');
+        const canvas = document.getElementById('ocrPreview');
+        const crop = pixelCrop(appliedCrop, canvas.width, canvas.height);
+        const preview = document.getElementById('ocrAppliedPreview');
+        preview.width = crop.w;
+        preview.height = crop.h;
+        preview.getContext('2d').drawImage(canvas, crop.x, crop.y, crop.w, crop.h,
+            0, 0, crop.w, crop.h);
+        preview.style.setProperty('--ocr-applied-min-width', crop.w / crop.h > 4 ? `${Math.ceil(120 * crop.w / crop.h)}px` : '0px');
+        document.getElementById('ocrCropStage').scrollTop = 0;
+        document.getElementById('ocrCropStage').scrollLeft = 0;
+        cropMode = 'applied';
+        updateCropControls();
+        setOcrStatus('Kadr gotowy ✓ Wybierz „Rozpoznaj zaznaczony tekst”.');
+    };
+
+    window.changeOcrCrop = function() {
+        if (!ocrImageReady || ocrBusy || cropMode !== 'applied') return;
+        cropMode = 'editing';
+        updateCropControls();
+        setOcrStatus('Zmień ramkę i ponownie wybierz „Zastosuj kadr”.');
     };
 
     window.resetOcrCrop = function() {
-        if (!ocrImageReady) return;
-        const changed = cropDirty || appliedCrop !== null ||
-            cropRect.x !== 0 || cropRect.y !== 0 || cropRect.w !== 1 || cropRect.h !== 1;
+        if (!ocrImageReady || ocrBusy) return;
+        const changed = cropDirty || appliedCrop !== null || !isFullCrop(cropRect);
+        if (changed && !confirmDiscardEdits()) return;
         if (changed) invalidateOcrResult();
         cropRect = fullCrop();
         appliedCrop = null;
         cropDirty = false;
+        cropMode = 'editing';
         cropDrag = null;
+        clearAppliedPreview();
         renderCropSelection();
-        document.getElementById('ocrRun').disabled = ocrBusy;
+        updateCropControls();
         setOcrStatus('Całe zdjęcie. Możesz uruchomić OCR bez przycinania.');
     };
 
     const cropSelection = document.getElementById('ocrCropSelection');
     cropSelection.addEventListener('pointerdown', event => {
         const handle = event.target?.dataset?.cropHandle;
-        if (!handle || !ocrImageReady) return;
+        if (!handle || !ocrImageReady || cropMode !== 'editing') return;
         event.preventDefault();
         cropDrag = {id: event.pointerId, handle, x: event.clientX, y: event.clientY, rect: {...cropRect}};
         cropSelection.setPointerCapture?.(event.pointerId);
@@ -135,11 +190,17 @@
         const minW = Math.min(1, 120 / canvas.width), minH = Math.min(1, 80 / canvas.height);
         const next = moveCrop(cropDrag.rect, cropDrag.handle, dx, dy, minW, minH);
         if (next.x === cropRect.x && next.y === cropRect.y && next.w === cropRect.w && next.h === cropRect.h) return;
+        if (!confirmDiscardEdits()) {
+            cropSelection.releasePointerCapture?.(event.pointerId);
+            cropDrag = null;
+            return;
+        }
         cropRect = next;
         appliedCrop = null;
         cropDirty = true;
         invalidateOcrResult();
-        document.getElementById('ocrRun').disabled = true;
+        clearAppliedPreview();
+        updateCropControls();
         setOcrStatus('Ustaw kadr, a potem wybierz „Zastosuj kadr”.');
         renderCropSelection();
     });
@@ -164,10 +225,8 @@
         if (reject) reject(new Error('cancelled'));
         releaseOcrWorker();
         ocrBusy = false;
-        document.getElementById('ocrRun').disabled = !ocrImageReady;
         document.getElementById('ocrCancel').disabled = true;
-        document.getElementById('ocrApplyCrop').disabled = !ocrImageReady;
-        document.getElementById('ocrResetCrop').disabled = !ocrImageReady;
+        updateCropControls();
         document.getElementById('ocrProgress').hidden = true;
         if (reject) setOcrStatus('Anulowano rozpoznawanie. Możesz spróbować ponownie.');
     }
@@ -183,19 +242,20 @@
         cropRect = fullCrop();
         appliedCrop = null;
         cropDirty = false;
+        cropMode = 'editing';
         cropDrag = null;
+        recognizedText = '';
         setEditorExpanded(false);
         const canvas = document.getElementById('ocrPreview');
         canvas.width = canvas.height = 0;
         canvas.hidden = true;
+        clearAppliedPreview();
         document.getElementById('ocrCropStage').hidden = true;
         document.getElementById('ocrCropTitle').hidden = true;
         document.getElementById('ocrCropActions').hidden = true;
         document.getElementById('ocrCropHint').hidden = true;
-        document.getElementById('ocrApplyCrop').disabled = true;
-        document.getElementById('ocrResetCrop').disabled = true;
         renderCropSelection();
-        document.getElementById('ocrRun').disabled = true;
+        updateCropControls();
         document.getElementById('ocrText').value = '';
         document.getElementById('ocrText').hidden = true;
         document.getElementById('ocrTextLabel').hidden = true;
@@ -236,8 +296,6 @@
             document.getElementById('ocrCropTitle').hidden = false;
             document.getElementById('ocrCropActions').hidden = false;
             document.getElementById('ocrCropHint').hidden = false;
-            document.getElementById('ocrApplyCrop').disabled = false;
-            document.getElementById('ocrResetCrop').disabled = false;
             document.getElementById('ocrCropStage').scrollTop = 0;
             renderCropSelection();
         } finally { bitmap.close(); }
@@ -260,7 +318,7 @@
             await decodeOcrPhoto(file, token, action, revision);
             if (!currentOcr(token, action, revision)) return;
             ocrImageReady = true;
-            document.getElementById('ocrRun').disabled = false;
+            updateCropControls();
             setOcrStatus('Zdjęcie gotowe. Uruchom rozpoznawanie.');
         } catch (error) {
             if (currentOcr(token, action, revision)) setOcrStatus(error.message);
@@ -298,23 +356,15 @@
     };
 
     window.runOcr = async function() {
-        if (!ocrImageReady || ocrBusy || cropDirty) return;
+        if (!ocrImageReady || ocrBusy || cropDirty || (cropMode !== 'applied' && !isFullCrop(cropRect)) ||
+            !confirmDiscardEdits()) return;
         const token = ++ocrGeneration, action = ocrAction, revision = ocrRevision;
-        const canvas = document.getElementById('ocrPreview');
-        const crop = appliedCrop ? pixelCrop(appliedCrop, canvas.width, canvas.height) : null;
-        const input = crop ? document.createElement('canvas') : canvas;
-        if (crop) {
-            input.width = crop.w;
-            input.height = crop.h;
-            input.getContext('2d').drawImage(canvas, crop.x, crop.y, crop.w, crop.h,
-                0, 0, crop.w, crop.h);
-        }
+        const input = document.getElementById(cropMode === 'applied' ? 'ocrAppliedPreview' : 'ocrPreview');
         ocrBusy = true;
         ocrResultReady = false;
-        document.getElementById('ocrRun').disabled = true;
+        recognizedText = '';
         document.getElementById('ocrCancel').disabled = false;
-        document.getElementById('ocrApplyCrop').disabled = true;
-        document.getElementById('ocrResetCrop').disabled = true;
+        updateCropControls();
         document.getElementById('ocrProgress').hidden = false;
         document.getElementById('ocrText').hidden = true;
         document.getElementById('ocrTextLabel').hidden = true;
@@ -354,6 +404,7 @@
             const result = await Promise.race([operation, cancelled, limit]);
             if (!currentOcr(token, action, revision)) return;
             const text = String(result.data?.text || '');
+            recognizedText = text;
             document.getElementById('ocrText').value = text;
             document.getElementById('ocrText').hidden = false;
             document.getElementById('ocrTextLabel').hidden = false;
@@ -366,15 +417,12 @@
             if (currentOcr(token, action, revision)) setOcrStatus('OCR nie powiodło się. Spróbuj ponownie.');
         } finally {
             clearTimeout(timeout);
-            if (crop) input.width = input.height = 0;
             if (token === ocrGeneration) {
                 ocrReject = null;
                 ocrBusy = false;
                 releaseOcrWorker();
                 document.getElementById('ocrCancel').disabled = true;
-                document.getElementById('ocrApplyCrop').disabled = !ocrImageReady;
-                document.getElementById('ocrResetCrop').disabled = !ocrImageReady;
-                document.getElementById('ocrRun').disabled = !ocrImageReady;
+                updateCropControls();
                 document.getElementById('ocrProgress').hidden = true;
             }
         }

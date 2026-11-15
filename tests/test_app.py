@@ -313,9 +313,11 @@ class ReaderTests(unittest.TestCase):
 
     def test_ocr_crop_and_mobile_editor_markup(self):
         page = self.client.get('/').text
-        for control in ('ocrCropStage', 'ocrCropSelection', 'ocrApplyCrop',
+        for control in ('ocrCropStage', 'ocrCropSelection', 'ocrAppliedPreview', 'ocrApplyCrop', 'ocrChangeCrop',
                         'ocrResetCrop', 'ocrExpand', 'ocrText', 'ocrApply'):
             self.assertIn(f'id="{control}"', page)
+        self.assertIn('Zmień kadr', page)
+        self.assertIn('Rozpoznaj zaznaczony tekst', self.client.get('/ocr-probe-assets/app-ocr.js').text)
         self.assertIn('data-crop-handle="move"', page)
         self.assertIn('data-crop-handle="se"', page)
         self.assertIn('ocr-editor-expanded', page)
