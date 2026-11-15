@@ -202,7 +202,7 @@ HTML_PAGE = """
         .sheet-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
         .sheet-heading h2 { margin: 0; font-size: 1.05rem; }
         .sheet-close { width: 44px; height: 44px; border: 0; border-radius: 50%; color: var(--text); background: var(--surface-light); font-size: 1.2rem; }
-        .import-options { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; }
+        .import-options { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
         .import-options button { min-height: 64px; border: 1px solid var(--surface-light); border-radius: 14px; color: var(--text); background: var(--bg); font: inherit; font-weight: 600; }
         .text-import-form[hidden] { display: none; }
         .text-import-form { display: flex; min-height: min(45dvh, 340px); flex-direction: column; gap: 10px; }
@@ -250,6 +250,49 @@ HTML_PAGE = """
         .add-content-dialog.ocr-editor-expanded .ocr-import { flex: 1; min-height: 0; overflow: hidden; }
         .add-content-dialog.ocr-editor-expanded #ocrText { flex: 1; min-height: 0; overflow: auto; resize: none; }
         .add-content-dialog.ocr-editor-expanded #ocrApply { flex: 0 0 auto; position: sticky; bottom: 0; margin-top: 0; }
+        .scan-import[hidden], .scan-import [hidden] { display: none; }
+        .scan-import { display: flex; flex-direction: column; gap: 12px; }
+        .scan-import button { min-height: 44px; border: 0; border-radius: 12px; padding: 9px 12px; color: var(--text); background: var(--surface-light); font: inherit; font-weight: 600; }
+        .scan-import button:disabled { opacity: .55; }
+        .scan-actions, .scan-page-actions, .scan-crop-actions, .scan-editor-nav { display: flex; flex-wrap: wrap; gap: 8px; }
+        .scan-actions button, .scan-crop-actions button, .scan-editor-nav button { flex: 1 1 140px; }
+        .scan-pages { display: flex; flex-direction: column; gap: 8px; }
+        .scan-page { display: flex; gap: 10px; align-items: flex-start; padding: 9px; border: 1px solid var(--surface-light); border-radius: 12px; }
+        .scan-page img { width: 64px; height: 82px; object-fit: contain; flex: 0 0 auto; background: white; border-radius: 6px; }
+        .scan-page-details { min-width: 0; flex: 1; }
+        .scan-page-details strong, .scan-page-details small { display: block; }
+        .scan-page-details small { color: var(--text-muted); margin: 3px 0 8px; }
+        .scan-page-actions button { min-height: 40px; flex: 1 1 74px; font-size: .82rem; }
+        .scan-crop-stage { max-height: min(48dvh, 500px); overflow: auto; padding: 6px 14px 6px 6px; border-radius: 10px; background: var(--bg); }
+        .scan-crop-surface { position: relative; width: 100%; overflow: hidden; }
+        .scan-crop-surface.is-applied { overflow: visible; }
+        .scan-crop-surface canvas { display: block; width: 100%; height: auto; background: white; }
+        .scan-crop-surface #scanAppliedPreview { width: max(100%, var(--scan-applied-min-width, 0px)); max-width: none; }
+        .scan-crop-selection { position: absolute; border: 2px solid var(--highlight-border); box-shadow: 0 0 0 3000px rgba(0,0,0,.38); pointer-events: none; }
+        .scan-crop-selection button { position: absolute; z-index: 1; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: transparent; pointer-events: auto; touch-action: none; }
+        .scan-crop-selection button::after { content: ''; display: block; width: 14px; height: 14px; margin: auto; border-radius: 50%; border: 2px solid white; background: var(--highlight-border); box-shadow: 0 1px 5px #000; }
+        .scan-crop-selection button[data-scan-handle="move"] { left: 50%; top: 50%; width: 72px; border-radius: 22px; background: var(--primary); color: white; font-size: .78rem; font-weight: 700; transform: translate(-50%,-50%); }
+        .scan-crop-selection button[data-scan-handle="move"]::after { display: none; }
+        .scan-crop-selection button[data-scan-handle="nw"] { left: 0; top: 0; }
+        .scan-crop-selection button[data-scan-handle="n"] { left: 50%; top: 0; transform: translateX(-50%); }
+        .scan-crop-selection button[data-scan-handle="ne"] { right: 0; top: 0; }
+        .scan-crop-selection button[data-scan-handle="e"] { right: 0; top: 50%; transform: translateY(-50%); }
+        .scan-crop-selection button[data-scan-handle="se"] { right: 0; bottom: 0; }
+        .scan-crop-selection button[data-scan-handle="s"] { left: 50%; bottom: 0; transform: translateX(-50%); }
+        .scan-crop-selection button[data-scan-handle="sw"] { left: 0; bottom: 0; }
+        .scan-crop-selection button[data-scan-handle="w"] { left: 0; top: 50%; transform: translateY(-50%); }
+        .scan-editor-view { display: flex; flex-direction: column; gap: 10px; }
+        #scanEditorText { min-height: min(45dvh, 360px); width: 100%; resize: vertical; }
+        .scan-import progress { width: 100%; accent-color: var(--primary); }
+        .scan-import #scanRecognize:not(:disabled), .scan-import #scanRead:not(:disabled) { color: white; background: var(--ocr-action); }
+        .scan-import #scanCropTitle.is-applied { color: var(--ocr-ready); }
+        .scan-import #scanDocumentName { width: 100%; }
+        .scan-note { color: var(--text-muted); font-size: .76rem; line-height: 1.4; }
+        .add-content-dialog.scan-editor-expanded { position: fixed; inset: var(--ocr-viewport-top, 0px) 0 auto; width: min(100%, 760px); max-width: none; height: var(--ocr-viewport-height, 100dvh); max-height: none; margin: 0 auto; border-radius: 0; overflow: hidden; }
+        .add-content-dialog.scan-editor-expanded .sheet-content { height: 100%; min-height: 0; overflow: hidden; padding-top: max(12px, env(safe-area-inset-top)); padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+        .add-content-dialog.scan-editor-expanded .import-options, .add-content-dialog.scan-editor-expanded .scan-main, .add-content-dialog.scan-editor-expanded #importStatus { display: none; }
+        .add-content-dialog.scan-editor-expanded .scan-import, .add-content-dialog.scan-editor-expanded .scan-editor-view { flex: 1; min-height: 0; overflow: hidden; }
+        .add-content-dialog.scan-editor-expanded #scanEditorText { flex: 1; min-height: 0; overflow: auto; resize: none; }
         .mini-player { display: flex; align-items: center; gap: 10px; min-height: 58px; flex: 0 0 auto; padding: 7px 10px; border: 1px solid var(--surface-light); border-radius: 16px; background: var(--surface); }
         .mini-player[hidden] { display: none; }
         .mini-player-main { display: flex; flex: 1 1 auto; min-width: 0; flex-direction: column; gap: 2px; cursor: pointer; }
@@ -350,7 +393,7 @@ HTML_PAGE = """
     <dialog class="add-content-dialog" id="addContentDialog" aria-labelledby="addContentTitle">
         <div class="sheet-content">
             <div class="sheet-heading"><h2 id="addContentTitle">Dodaj treść</h2><button class="sheet-close" aria-label="Zamknij" onclick="window.closeAddContentDialog()">×</button></div>
-            <div class="import-options"><button id="chooseFileImport" onclick="window.chooseFileImport()">📂 Wybierz PDF, DOCX lub TXT</button><button id="chooseTextImport" onclick="window.showTextImport()">📝 Wklej tekst</button><button id="choosePhotoImport" onclick="window.showPhotoImport()">📷 Zdjęcie</button></div>
+            <div class="import-options"><button id="chooseFileImport" onclick="window.chooseFileImport()">📂 Wybierz PDF, DOCX lub TXT</button><button id="chooseTextImport" onclick="window.showTextImport()">📝 Wklej tekst</button><button id="choosePhotoImport" onclick="window.showPhotoImport()">📷 Zdjęcie</button><button id="chooseScanImport" onclick="window.showDocumentScanner()">📄 Skanuj dokument</button></div>
             <form class="text-import-form" id="textImportForm" hidden onsubmit="event.preventDefault(); window.applyText()">
                 <label for="rawText">Tekst do przeczytania</label>
                 <textarea id="rawText" placeholder="Wklej tutaj dowolny tekst do przeczytania..."></textarea>
@@ -385,6 +428,40 @@ HTML_PAGE = """
                 <button type="button" id="ocrExpand" aria-expanded="false" onclick="window.toggleOcrEditor()" hidden>Rozwiń edytor</button>
                 <textarea id="ocrText" aria-labelledby="ocrTextLabel" spellcheck="true" hidden></textarea>
                 <button class="apply-btn" type="button" id="ocrApply" onclick="window.applyOcrText()" hidden>✔️ Czytaj tekst</button>
+            </section>
+            <section class="scan-import" id="scanImport" aria-label="Skanowanie dokumentu" hidden>
+                <div class="scan-main">
+                    <div class="scan-actions"><button type="button" id="scanCameraButton" onclick="window.chooseScanPhoto('camera')">Zrób zdjęcie strony</button><button type="button" id="scanGalleryButton" onclick="window.chooseScanPhoto('gallery')">Dodaj strony z galerii</button></div>
+                    <input type="file" id="scanCameraInput" accept="image/jpeg,image/png,image/webp" capture="environment" hidden>
+                    <input type="file" id="scanGalleryInput" accept="image/jpeg,image/png,image/webp" multiple hidden>
+                    <strong id="scanCount">0 stron</strong>
+                    <div class="scan-pages" id="scanPages" aria-label="Strony dokumentu"></div>
+                    <div id="scanPageView" hidden>
+                        <strong id="scanCropTitle">Przytnij stronę (opcjonalnie)</strong>
+                        <div class="scan-crop-stage" id="scanCropStage">
+                            <div class="scan-crop-surface" id="scanCropSurface">
+                                <canvas id="scanPreview" aria-label="Podgląd strony"></canvas>
+                                <canvas id="scanAppliedPreview" aria-label="Podgląd zastosowanego kadru" hidden></canvas>
+                                <div class="scan-crop-selection" id="scanCropSelection" aria-label="Zaznaczony kadr strony">
+                                    <button type="button" data-scan-handle="nw" aria-label="Zmień lewy górny róg kadru"></button><button type="button" data-scan-handle="n" aria-label="Zmień górną krawędź kadru"></button><button type="button" data-scan-handle="ne" aria-label="Zmień prawy górny róg kadru"></button><button type="button" data-scan-handle="e" aria-label="Zmień prawą krawędź kadru"></button><button type="button" data-scan-handle="se" aria-label="Zmień prawy dolny róg kadru"></button><button type="button" data-scan-handle="s" aria-label="Zmień dolną krawędź kadru"></button><button type="button" data-scan-handle="sw" aria-label="Zmień lewy dolny róg kadru"></button><button type="button" data-scan-handle="w" aria-label="Zmień lewą krawędź kadru"></button><button type="button" data-scan-handle="move" aria-label="Przesuń kadr">Przesuń</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="scan-crop-actions"><button type="button" id="scanApplyCrop" onclick="window.applyScanCrop()">Zastosuj kadr</button><button type="button" id="scanChangeCrop" onclick="window.changeScanCrop()" hidden>Zmień kadr</button><button type="button" id="scanWholePhoto" onclick="window.resetScanCrop()">Całe zdjęcie</button><button type="button" id="scanClosePage" onclick="window.closeScanPage()">Wróć do stron</button></div>
+                    </div>
+                    <div id="scanStatus" class="import-status" role="status" aria-live="polite">Dodaj pierwszą stronę. Zdjęcia pozostają tylko w pamięci do zamknięcia skanu.</div>
+                    <progress id="scanProgress" max="100" value="0" aria-label="Postęp rozpoznawania" hidden></progress>
+                    <div class="scan-actions"><button type="button" id="scanRecognize" onclick="window.recognizeScanPages()" disabled>Rozpoznaj wszystkie strony</button><button type="button" id="scanCancel" onclick="window.cancelScanRecognition()" disabled>Anuluj OCR</button></div>
+                    <label for="scanDocumentName">Nazwa dokumentu</label><input id="scanDocumentName" value="Skan dokumentu" maxlength="120">
+                    <button type="button" id="scanRead" onclick="window.readScanDocument()" disabled>Czytaj dokument</button>
+                    <small class="scan-note">Skan jest tymczasowy. Odświeżenie lub zamknięcie strony usunie zdjęcia i niezapisane poprawki.</small>
+                </div>
+                <div class="scan-editor-view" id="scanEditorView" hidden>
+                    <strong id="scanEditorPage">Strona 1 z 1</strong>
+                    <div class="scan-editor-nav"><button type="button" id="scanPreviousPage" onclick="window.navigateScanEditor(-1)">Poprzednia</button><button type="button" id="scanNextPage" onclick="window.navigateScanEditor(1)">Następna</button></div>
+                    <label for="scanEditorText">Popraw tekst strony</label><textarea id="scanEditorText" spellcheck="true"></textarea>
+                    <button type="button" id="scanEditorDone" onclick="window.closeScanEditor()">Wróć do stron</button>
+                </div>
             </section>
             <div class="import-status" id="importStatus" role="status" aria-live="polite"></div>
         </div>
@@ -500,12 +577,34 @@ HTML_PAGE = """
     }) : {reset() {}, active() { return false; }};
     if (typeof window.showPhotoImport !== 'function')
         window.showPhotoImport = () => setImportStatus('OCR jest chwilowo niedostępny. Wybierz plik lub wklej tekst.');
+    const scanner = typeof window.createDocumentScanner === 'function' ? window.createDocumentScanner({
+        getAction: () => resumeUserAction,
+        nextAction: () => ++resumeUserAction,
+        getRevision: () => resumeDocumentRevision,
+        resetPhotoImport: () => ocrImport.reset(),
+        commitText: (text, name) => {
+            resumeUserAction++;
+            renderSentences(text, [], {name});
+            window.closeAddContentDialog();
+            window.switchTab('reader');
+        }
+    }) : {reset() {}, confirmLeave() { return true; }, active() { return false; }};
+    if (typeof window.showDocumentScanner !== 'function')
+        window.showDocumentScanner = () => setImportStatus('Skanowanie jest chwilowo niedostępne. Wybierz plik lub wklej tekst.');
+    const showSinglePhotoImport = window.showPhotoImport;
+    window.showPhotoImport = function() {
+        if (!scanner.confirmLeave()) return;
+        scanner.reset();
+        showSinglePhotoImport();
+    };
 
     window.openAddContentDialog = function() {
+        if (!scanner.confirmLeave()) return;
         const dialog = document.getElementById('addContentDialog');
         dialogReturnFocus = document.activeElement;
         document.getElementById('textImportForm').hidden = true;
         ocrImport.reset();
+        scanner.reset();
         setImportStatus('');
         document.body.classList.add('modal-open');
         dialog.hidden = false;
@@ -515,6 +614,8 @@ HTML_PAGE = """
     };
 
     window.closeAddContentDialog = function() {
+        if (!scanner.confirmLeave()) return false;
+        scanner.reset();
         ocrImport.reset();
         const dialog = document.getElementById('addContentDialog');
         const nativeDialog = typeof dialog.showModal === 'function' && typeof dialog.close === 'function';
@@ -522,16 +623,19 @@ HTML_PAGE = """
         else { dialog.open = false; dialog.hidden = true; }
         document.body.classList.remove('modal-open', 'keyboard-open');
         dialogReturnFocus?.focus?.();
+        return true;
     };
 
     window.showTextImport = function() {
+        if (!scanner.confirmLeave()) return;
+        scanner.reset();
         ocrImport.reset();
         document.getElementById('textImportForm').hidden = false;
         document.getElementById('rawText').focus?.();
     };
 
     window.chooseFileImport = function() {
-        window.closeAddContentDialog();
+        if (!window.closeAddContentDialog()) return;
         document.getElementById('fileInput').click();
     };
 
@@ -539,11 +643,14 @@ HTML_PAGE = """
         if (event.target === document.getElementById('addContentDialog')) window.closeAddContentDialog();
     });
     document.getElementById('addContentDialog').addEventListener('close', () => {
+        scanner.reset();
         ocrImport.reset();
         document.body.classList.remove('modal-open', 'keyboard-open');
         dialogReturnFocus?.focus?.();
     });
-    document.getElementById('addContentDialog').addEventListener('cancel', () => {
+    document.getElementById('addContentDialog').addEventListener('cancel', event => {
+        if (!scanner.confirmLeave()) { event.preventDefault(); return; }
+        scanner.reset();
         ocrImport.reset();
         document.body.classList.remove('modal-open', 'keyboard-open');
         dialogReturnFocus?.focus?.();
@@ -1288,9 +1395,14 @@ HTML_PAGE = """
     }
 
     window.switchTab = function(tab) {
-        if (tab === 'editor') { window.openAddContentDialog(); window.showTextImport(); return; }
-        if (document.getElementById('addContentDialog').open && !document.getElementById('ocrImport').hidden)
-            window.closeAddContentDialog();
+        if (tab === 'editor') {
+            if (!document.getElementById('addContentDialog').open) window.openAddContentDialog();
+            window.showTextImport();
+            return;
+        }
+        if (document.getElementById('addContentDialog').open &&
+            (!document.getElementById('ocrImport').hidden || scanner.active()) &&
+            !window.closeAddContentDialog()) return;
         tab = tab === 'history' ? 'history' : 'reader';
         activeTab = tab;
         document.getElementById('readerView').style.display = tab === 'reader' ? 'flex' : 'none';
@@ -1318,6 +1430,7 @@ HTML_PAGE = """
 
     function renderSentences(text, hints = [], options = {}) {
         if (ocrImport.active()) ocrImport.reset();
+        if (scanner.active()) scanner.reset();
         window.stopReading();
         if (!options.restored) resumeUserAction++;
         resumeDocumentRevision++;
