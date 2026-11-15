@@ -7,29 +7,41 @@ const ok = () => ({ok: true, blob: async () => ({size: 10, arrayBuffer: async ()
 const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
 function memoryIndexedDB() {
     const data = new Map();
-    const control = {data, failWrites: 0};
+    const control = {data, failWrites: 0, holdNextReadwriteGet: false, releaseHeldRead: null};
     const db = {
         objectStoreNames: {contains: name => name === 'documents'},
         createObjectStore() {},
-        transaction(name) {
+        transaction(name, mode) {
             assert.equal(name, 'documents');
             const tx = {error: null};
+            let pending = 0;
+            const completeWhenIdle = () => {
+                if (!pending) setTimeout(() => { if (!pending) tx.oncomplete?.(); }, 0);
+            };
+            const schedule = callback => {
+                pending++;
+                setTimeout(() => { callback(); pending--; completeWhenIdle(); }, 0);
+            };
             tx.objectStore = () => ({
                 get(key) {
                     const request = {};
-                    setTimeout(() => { request.result = data.get(key) || null; request.onsuccess?.(); tx.oncomplete?.(); }, 0);
+                    const run = () => schedule(() => { request.result = data.get(key) || null; request.onsuccess?.(); });
+                    if (mode === 'readwrite' && control.holdNextReadwriteGet) {
+                        control.holdNextReadwriteGet = false;
+                        control.releaseHeldRead = run;
+                    } else run();
                     return request;
                 },
                 put(record) {
-                    setTimeout(() => {
+                    schedule(() => {
                         if (control.failWrites) {
                             control.failWrites--;
                             tx.error = Object.assign(new Error('quota exceeded'), {name: 'QuotaExceededError'});
                             tx.onerror?.(); tx.onabort?.();
-                        } else { data.set(record.id, JSON.parse(JSON.stringify(record))); tx.oncomplete?.(); }
-                    }, 0);
+                        } else data.set(record.id, JSON.parse(JSON.stringify(record)));
+                    });
                 },
-                delete(key) { setTimeout(() => { data.delete(key); tx.oncomplete?.(); }, 0); }
+                delete(key) { schedule(() => { data.delete(key); }); }
             });
             return tx;
         }
@@ -1341,6 +1353,22 @@ test('UX-01 stary lub uszkodzony zapis jest odrzucany do pustego stanu', async (
     assert.equal(h.run('isReading'), false);
     assert.equal(h.audios.at(-1).plays, 0);
     assert.equal(idb.data.has('last'), false);
+});
+test('UX-01 opóźnione czyszczenie starego rekordu nie usuwa nowego dokumentu', async () => {
+    const idb = memoryIndexedDB();
+    idb.data.set('last', {id:'last', version:1, segmentationVersion:99, text:'Stary niezgodny tekst.', name:'old.txt',
+        blocks:[], sentenceCount:1, index:0, completed:false, voice:'pl-PL-ZofiaNeural', rate:'0', savedAt:100});
+    idb.holdNextReadwriteGet = true;
+    const h = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    assert.equal(typeof idb.releaseHeldRead, 'function', 'invalid-record cleanup is paused in its readwrite transaction');
+
+    h.run('renderSentences("Nowy dokument.", [], {name:"nowy.txt"})');
+    idb.releaseHeldRead();
+    await settle();
+    assert.equal(idb.data.get('last').text, 'Nowy dokument.');
+    assert.equal(idb.data.get('last').name, 'nowy.txt');
+    assert.equal(idb.data.get('last').segmentationVersion, 1);
 });
 test('UX-01 usuń czyści dokument i nie zapisuje go ponownie podczas stopu', async () => {
     const idb = memoryIndexedDB();

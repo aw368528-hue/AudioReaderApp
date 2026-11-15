@@ -244,6 +244,7 @@ HTML_PAGE = """
     let resumeUserAction = 0;
     let lastProgressSaveAt = 0;
     let lastProgressSavedIndex = null;
+    let resumeWriteSequence = 0;
     let resumeStoredRecord = null;
     let currentDocument = null;
     let resumeSavingEnabled = true;
@@ -304,18 +305,52 @@ HTML_PAGE = """
         });
     }
 
-    async function eraseResumeRecord() {
+    function sameResumeRecord(left, right) {
+        if (!left || !right) return false;
+        if (typeof left.writeToken === 'string' || typeof right.writeToken === 'string')
+            return typeof left.writeToken === 'string' && left.writeToken === right.writeToken;
+        return left.id === right.id && left.version === right.version &&
+            left.segmentationVersion === right.segmentationVersion && left.text === right.text &&
+            left.name === right.name && left.index === right.index && left.completed === right.completed &&
+            left.savedAt === right.savedAt && JSON.stringify(left.blocks) === JSON.stringify(right.blocks);
+    }
+
+    async function eraseResumeRecord(expectedRecord = null, stillCurrent = () => true) {
         const db = await openResumeDatabase();
         return new Promise((resolve, reject) => {
             let transaction;
             try {
                 transaction = db.transaction(RESUME_STORE, 'readwrite');
-                transaction.objectStore(RESUME_STORE).delete(RESUME_KEY);
             } catch (error) { reject(error); return; }
-            transaction.oncomplete = () => resolve();
+            let removed = false;
+            transaction.oncomplete = () => resolve(removed);
             transaction.onerror = () => reject(transaction.error || new Error('indexeddb_delete_failed'));
             transaction.onabort = () => reject(transaction.error || new Error('indexeddb_delete_failed'));
+            try {
+                const store = transaction.objectStore(RESUME_STORE);
+                if (!expectedRecord) {
+                    store.delete(RESUME_KEY);
+                    removed = true;
+                } else {
+                    const request = store.get(RESUME_KEY);
+                    request.onsuccess = () => {
+                        if (!stillCurrent() || !sameResumeRecord(request.result, expectedRecord)) return;
+                        store.delete(RESUME_KEY);
+                        removed = true;
+                    };
+                    request.onerror = () => reject(request.error || new Error('indexeddb_delete_failed'));
+                }
+            } catch (error) { reject(error); }
         });
+    }
+
+    function queueInvalidResumeCleanup(expectedRecord, action, revision) {
+        resumeWriteQueue = resumeWriteQueue.catch(() => {}).then(() => {
+            if (action !== resumeUserAction || revision !== resumeDocumentRevision) return false;
+            return eraseResumeRecord(expectedRecord,
+                () => action === resumeUserAction && revision === resumeDocumentRevision);
+        });
+        return resumeWriteQueue;
     }
 
     function safeResumeBlocks(blocks, textLength) {
@@ -349,7 +384,8 @@ HTML_PAGE = """
             index: currentDocument.completed ? sentences.length : Math.max(0, Math.min(currentIdx, Math.max(0, sentences.length - 1))),
             completed: !!currentDocument.completed,
             voice: document.getElementById('voiceSelect').value,
-            rate: String(document.getElementById('rateSlider').value), savedAt: Date.now()};
+            rate: String(document.getElementById('rateSlider').value), savedAt: Date.now(),
+            writeToken: `${Date.now()}-${++resumeWriteSequence}-${Math.random().toString(36).slice(2)}`};
     }
 
     function saveResumeProgress(force = false) {
@@ -397,7 +433,7 @@ HTML_PAGE = """
             }
             const blocks = safeResumeBlocks(record.blocks, typeof record.text === 'string' ? record.text.length : -1);
             if (!validResumeRecord(record) || !blocks || speechSegments(record.text, blocks).length !== record.sentenceCount) {
-                await eraseResumeRecord();
+                await queueInvalidResumeCleanup(record, action, originalRevision);
                 if (action === resumeUserAction && originalRevision === resumeDocumentRevision) {
                     resumeStoredRecord = null;
                     resumeMessage('Zapis lokalny', 'Nie udało się zweryfikować starego zapisu. Wczytaj dokument ponownie.');
