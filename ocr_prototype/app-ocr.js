@@ -1,5 +1,23 @@
 (function (root) {
     'use strict';
+    const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+    const fullCrop = () => ({x: 0, y: 0, w: 1, h: 1});
+    function moveCrop(rect, handle, dx, dy, minW, minH) {
+        if (handle === 'move') return {x: clamp(rect.x + dx, 0, 1 - rect.w),
+            y: clamp(rect.y + dy, 0, 1 - rect.h), w: rect.w, h: rect.h};
+        let left = rect.x, right = rect.x + rect.w, top = rect.y, bottom = rect.y + rect.h;
+        if (handle.includes('w')) left = clamp(left + dx, 0, right - minW);
+        if (handle.includes('e')) right = clamp(right + dx, left + minW, 1);
+        if (handle.includes('n')) top = clamp(top + dy, 0, bottom - minH);
+        if (handle.includes('s')) bottom = clamp(bottom + dy, top + minH, 1);
+        return {x: left, y: top, w: right - left, h: bottom - top};
+    }
+    function pixelCrop(rect, width, height) {
+        const x = Math.floor(rect.x * width), y = Math.floor(rect.y * height);
+        return {x, y, w: Math.max(1, Math.min(width - x, Math.ceil((rect.x + rect.w) * width) - x)),
+            h: Math.max(1, Math.min(height - y, Math.ceil((rect.y + rect.h) * height) - y))};
+    }
+    root.ocrCropGeometry = {moveCrop, pixelCrop, fullCrop};
     root.createOcrImport = function(callbacks) {
     const OCR_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js';
     const OCR_MAX_FILE_BYTES = 12 * 1024 * 1024;
@@ -16,12 +34,122 @@
     let ocrResultReady = false;
     let ocrAction = 0;
     let ocrRevision = 0;
+    let cropRect = fullCrop();
+    let appliedCrop = null;
+    let cropDirty = false;
+    let cropDrag = null;
 
     function setOcrStatus(message, progress = null) {
         document.getElementById('ocrStatus').textContent = message;
         const bar = document.getElementById('ocrProgress');
         if (progress !== null) bar.value = Math.max(0, Math.min(100, progress));
     }
+
+    function renderCropSelection() {
+        const selection = document.getElementById('ocrCropSelection');
+        selection.style.left = `${cropRect.x * 100}%`;
+        selection.style.top = `${cropRect.y * 100}%`;
+        selection.style.width = `${cropRect.w * 100}%`;
+        selection.style.height = `${cropRect.h * 100}%`;
+    }
+
+    function invalidateOcrResult() {
+        if (ocrBusy) cancelOcrRecognition();
+        ocrResultReady = false;
+        document.getElementById('ocrText').value = '';
+        document.getElementById('ocrText').hidden = true;
+        document.getElementById('ocrTextLabel').hidden = true;
+        document.getElementById('ocrApply').hidden = true;
+        document.getElementById('ocrExpand').hidden = true;
+        setEditorExpanded(false);
+    }
+
+    function setEditorExpanded(expanded) {
+        const dialog = document.getElementById('addContentDialog');
+        dialog.classList.toggle('ocr-editor-expanded', expanded);
+        const button = document.getElementById('ocrExpand');
+        button.textContent = expanded ? 'Zwiń edytor' : 'Rozwiń edytor';
+        button.setAttribute?.('aria-expanded', String(expanded));
+        if (expanded) {
+            syncEditorViewport();
+            document.getElementById('ocrText').focus?.();
+        }
+    }
+
+    function syncEditorViewport() {
+        const viewport = window.visualViewport;
+        if (!viewport) return;
+        const dialog = document.getElementById('addContentDialog');
+        dialog.style.setProperty('--ocr-viewport-height', `${Math.round(viewport.height)}px`);
+        dialog.style.setProperty('--ocr-viewport-top', `${Math.round(viewport.offsetTop)}px`);
+    }
+
+    window.visualViewport?.addEventListener('resize', syncEditorViewport);
+    window.visualViewport?.addEventListener('scroll', syncEditorViewport);
+    window.addEventListener?.('orientationchange', () => { cropDrag = null; syncEditorViewport(); });
+
+    window.toggleOcrEditor = function() {
+        if (!ocrResultReady) return;
+        const dialog = document.getElementById('addContentDialog');
+        setEditorExpanded(!dialog.classList.contains('ocr-editor-expanded'));
+    };
+
+    window.applyOcrCrop = function() {
+        if (!ocrImageReady) return;
+        appliedCrop = {...cropRect};
+        cropDirty = false;
+        document.getElementById('ocrRun').disabled = ocrBusy;
+        setOcrStatus('Kadr zastosowany. Uruchom rozpoznawanie.');
+    };
+
+    window.resetOcrCrop = function() {
+        if (!ocrImageReady) return;
+        const changed = cropDirty || appliedCrop !== null ||
+            cropRect.x !== 0 || cropRect.y !== 0 || cropRect.w !== 1 || cropRect.h !== 1;
+        if (changed) invalidateOcrResult();
+        cropRect = fullCrop();
+        appliedCrop = null;
+        cropDirty = false;
+        cropDrag = null;
+        renderCropSelection();
+        document.getElementById('ocrRun').disabled = ocrBusy;
+        setOcrStatus('Całe zdjęcie. Możesz uruchomić OCR bez przycinania.');
+    };
+
+    const cropSelection = document.getElementById('ocrCropSelection');
+    cropSelection.addEventListener('pointerdown', event => {
+        const handle = event.target?.dataset?.cropHandle;
+        if (!handle || !ocrImageReady) return;
+        event.preventDefault();
+        cropDrag = {id: event.pointerId, handle, x: event.clientX, y: event.clientY, rect: {...cropRect}};
+        cropSelection.setPointerCapture?.(event.pointerId);
+    });
+    cropSelection.addEventListener('pointermove', event => {
+        if (!cropDrag || event.pointerId !== cropDrag.id) return;
+        event.preventDefault();
+        const canvas = document.getElementById('ocrPreview');
+        const bounds = canvas.getBoundingClientRect();
+        if (!bounds.width || !bounds.height) return;
+        const dx = (event.clientX - cropDrag.x) / bounds.width;
+        const dy = (event.clientY - cropDrag.y) / bounds.height;
+        const minW = Math.min(1, 120 / canvas.width), minH = Math.min(1, 80 / canvas.height);
+        const next = moveCrop(cropDrag.rect, cropDrag.handle, dx, dy, minW, minH);
+        if (next.x === cropRect.x && next.y === cropRect.y && next.w === cropRect.w && next.h === cropRect.h) return;
+        cropRect = next;
+        appliedCrop = null;
+        cropDirty = true;
+        invalidateOcrResult();
+        document.getElementById('ocrRun').disabled = true;
+        setOcrStatus('Ustaw kadr, a potem wybierz „Zastosuj kadr”.');
+        renderCropSelection();
+    });
+    const endCropDrag = event => {
+        if (cropDrag?.id !== event.pointerId) return;
+        cropSelection.releasePointerCapture?.(event.pointerId);
+        cropDrag = null;
+    };
+    cropSelection.addEventListener('pointerup', endCropDrag);
+    cropSelection.addEventListener('pointercancel', endCropDrag);
 
     function releaseOcrWorker() {
         const previous = ocrWorker;
@@ -38,6 +166,8 @@
         ocrBusy = false;
         document.getElementById('ocrRun').disabled = !ocrImageReady;
         document.getElementById('ocrCancel').disabled = true;
+        document.getElementById('ocrApplyCrop').disabled = !ocrImageReady;
+        document.getElementById('ocrResetCrop').disabled = !ocrImageReady;
         document.getElementById('ocrProgress').hidden = true;
         if (reject) setOcrStatus('Anulowano rozpoznawanie. Możesz spróbować ponownie.');
     }
@@ -50,14 +180,27 @@
         ocrDecoding = false;
         ocrAction = 0;
         ocrRevision = 0;
+        cropRect = fullCrop();
+        appliedCrop = null;
+        cropDirty = false;
+        cropDrag = null;
+        setEditorExpanded(false);
         const canvas = document.getElementById('ocrPreview');
         canvas.width = canvas.height = 0;
         canvas.hidden = true;
+        document.getElementById('ocrCropStage').hidden = true;
+        document.getElementById('ocrCropTitle').hidden = true;
+        document.getElementById('ocrCropActions').hidden = true;
+        document.getElementById('ocrCropHint').hidden = true;
+        document.getElementById('ocrApplyCrop').disabled = true;
+        document.getElementById('ocrResetCrop').disabled = true;
+        renderCropSelection();
         document.getElementById('ocrRun').disabled = true;
         document.getElementById('ocrText').value = '';
         document.getElementById('ocrText').hidden = true;
         document.getElementById('ocrTextLabel').hidden = true;
         document.getElementById('ocrApply').hidden = true;
+        document.getElementById('ocrExpand').hidden = true;
         document.getElementById('ocrCameraInput').value = '';
         document.getElementById('ocrGalleryInput').value = '';
         document.getElementById('ocrImport').hidden = true;
@@ -89,6 +232,14 @@
             context.fillRect(0, 0, canvas.width, canvas.height);
             context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
             canvas.hidden = false;
+            document.getElementById('ocrCropStage').hidden = false;
+            document.getElementById('ocrCropTitle').hidden = false;
+            document.getElementById('ocrCropActions').hidden = false;
+            document.getElementById('ocrCropHint').hidden = false;
+            document.getElementById('ocrApplyCrop').disabled = false;
+            document.getElementById('ocrResetCrop').disabled = false;
+            document.getElementById('ocrCropStage').scrollTop = 0;
+            renderCropSelection();
         } finally { bitmap.close(); }
     }
 
@@ -147,17 +298,29 @@
     };
 
     window.runOcr = async function() {
-        if (!ocrImageReady || ocrBusy) return;
+        if (!ocrImageReady || ocrBusy || cropDirty) return;
         const token = ++ocrGeneration, action = ocrAction, revision = ocrRevision;
         const canvas = document.getElementById('ocrPreview');
+        const crop = appliedCrop ? pixelCrop(appliedCrop, canvas.width, canvas.height) : null;
+        const input = crop ? document.createElement('canvas') : canvas;
+        if (crop) {
+            input.width = crop.w;
+            input.height = crop.h;
+            input.getContext('2d').drawImage(canvas, crop.x, crop.y, crop.w, crop.h,
+                0, 0, crop.w, crop.h);
+        }
         ocrBusy = true;
         ocrResultReady = false;
         document.getElementById('ocrRun').disabled = true;
         document.getElementById('ocrCancel').disabled = false;
+        document.getElementById('ocrApplyCrop').disabled = true;
+        document.getElementById('ocrResetCrop').disabled = true;
         document.getElementById('ocrProgress').hidden = false;
         document.getElementById('ocrText').hidden = true;
         document.getElementById('ocrTextLabel').hidden = true;
         document.getElementById('ocrApply').hidden = true;
+        document.getElementById('ocrExpand').hidden = true;
+        setEditorExpanded(false);
         setOcrStatus('Ładowanie polskiego modelu OCR…', 0);
         let timeout;
         try {
@@ -186,7 +349,7 @@
                     throw new Error('cancelled');
                 }
                 ocrWorker = created;
-                return created.recognize(canvas);
+                return created.recognize(input);
             })();
             const result = await Promise.race([operation, cancelled, limit]);
             if (!currentOcr(token, action, revision)) return;
@@ -195,6 +358,7 @@
             document.getElementById('ocrText').hidden = false;
             document.getElementById('ocrTextLabel').hidden = false;
             document.getElementById('ocrApply').hidden = false;
+            document.getElementById('ocrExpand').hidden = false;
             ocrResultReady = true;
             setOcrStatus(text.trim() ? 'Popraw tekst i wybierz „Czytaj tekst”.' :
                 'Nie rozpoznano tekstu. Możesz wpisać go ręcznie lub spróbować ponownie.', 100);
@@ -202,11 +366,14 @@
             if (currentOcr(token, action, revision)) setOcrStatus('OCR nie powiodło się. Spróbuj ponownie.');
         } finally {
             clearTimeout(timeout);
+            if (crop) input.width = input.height = 0;
             if (token === ocrGeneration) {
                 ocrReject = null;
                 ocrBusy = false;
                 releaseOcrWorker();
                 document.getElementById('ocrCancel').disabled = true;
+                document.getElementById('ocrApplyCrop').disabled = !ocrImageReady;
+                document.getElementById('ocrResetCrop').disabled = !ocrImageReady;
                 document.getElementById('ocrRun').disabled = !ocrImageReady;
                 document.getElementById('ocrProgress').hidden = true;
             }

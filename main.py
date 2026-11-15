@@ -205,18 +205,43 @@ HTML_PAGE = """
         .text-import-form[hidden] { display: none; }
         .text-import-form { display: flex; min-height: min(45dvh, 340px); flex-direction: column; gap: 10px; }
         .text-import-form textarea { min-height: 150px; }
-        .ocr-import[hidden], .ocr-import textarea[hidden], .ocr-import canvas[hidden], .ocr-import progress[hidden] { display: none; }
+        .ocr-import[hidden], .ocr-import textarea[hidden], .ocr-import canvas[hidden], .ocr-import progress[hidden], .ocr-crop-stage[hidden], .ocr-crop-actions[hidden], .ocr-crop-hint[hidden], .ocr-import button[hidden], .ocr-import label[hidden] { display: none; }
         .ocr-import { display: flex; flex-direction: column; gap: 10px; }
         .ocr-choices { display: flex; flex-wrap: wrap; gap: 8px; }
-        .ocr-choices button, .ocr-actions button { min-height: 44px; border: 0; border-radius: 12px; padding: 9px 12px; color: var(--text); background: var(--surface-light); font: inherit; font-weight: 600; }
+        .ocr-choices button, .ocr-actions button, .ocr-crop-actions button, #ocrExpand { min-height: 44px; border: 0; border-radius: 12px; padding: 9px 12px; color: var(--text); background: var(--surface-light); font: inherit; font-weight: 600; }
         .ocr-choices button { flex: 1 1 145px; }
-        .ocr-import canvas { align-self: center; max-width: 100%; max-height: 32dvh; background: white; border-radius: 8px; }
+        .ocr-crop-stage { width: 100%; max-height: min(48dvh, 500px); overflow: auto; overscroll-behavior: contain; padding: 6px 14px 6px 6px; border-radius: 10px; background: var(--bg); }
+        .ocr-crop-surface { position: relative; width: 100%; overflow: hidden; }
+        .ocr-crop-surface canvas { display: block; width: 100%; height: auto; background: white; }
+        .ocr-crop-selection { position: absolute; border: 2px solid var(--highlight-border); box-shadow: 0 0 0 3000px rgba(0,0,0,.38); pointer-events: none; }
+        .ocr-crop-selection button { position: absolute; z-index: 1; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: transparent; pointer-events: auto; touch-action: none; }
+        .ocr-crop-selection button::after { content: ''; display: block; width: 14px; height: 14px; margin: auto; border-radius: 50%; border: 2px solid white; background: var(--highlight-border); box-shadow: 0 1px 5px #000; }
+        .ocr-crop-selection button[data-crop-handle="move"] { left: 50%; top: 50%; width: 72px; border-radius: 22px; background: var(--primary); color: white; font-size: .78rem; font-weight: 700; transform: translate(-50%,-50%); }
+        .ocr-crop-selection button[data-crop-handle="move"]::after { display: none; }
+        .ocr-crop-selection button[data-crop-handle="nw"] { left: 0; top: 0; }
+        .ocr-crop-selection button[data-crop-handle="n"] { left: 50%; top: 0; transform: translateX(-50%); }
+        .ocr-crop-selection button[data-crop-handle="ne"] { right: 0; top: 0; }
+        .ocr-crop-selection button[data-crop-handle="e"] { right: 0; top: 50%; transform: translateY(-50%); }
+        .ocr-crop-selection button[data-crop-handle="se"] { right: 0; bottom: 0; }
+        .ocr-crop-selection button[data-crop-handle="s"] { left: 50%; bottom: 0; transform: translateX(-50%); }
+        .ocr-crop-selection button[data-crop-handle="sw"] { left: 0; bottom: 0; }
+        .ocr-crop-selection button[data-crop-handle="w"] { left: 0; top: 50%; transform: translateY(-50%); }
+        .ocr-crop-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        .ocr-crop-actions button { flex: 1 1 145px; }
+        .ocr-crop-hint { color: var(--text-muted); font-size: .76rem; line-height: 1.4; }
         .ocr-import progress { width: 100%; accent-color: var(--primary); }
         .ocr-import textarea { flex: none; min-height: 170px; resize: vertical; }
+        #ocrExpand { width: 100%; }
         .ocr-actions { display: flex; flex-wrap: wrap; gap: 8px; }
         .ocr-actions button { flex: 1 1 140px; }
         .ocr-actions .apply-btn { margin-top: 0; color: white; background: var(--primary); }
         .ocr-import button:disabled { opacity: .55; }
+        .add-content-dialog.ocr-editor-expanded { position: fixed; inset: var(--ocr-viewport-top, 0px) 0 auto; width: min(100%, 760px); max-width: none; height: var(--ocr-viewport-height, 100dvh); max-height: none; margin: 0 auto; border-radius: 0; overflow: hidden; }
+        .add-content-dialog.ocr-editor-expanded .sheet-content { height: 100%; min-height: 0; overflow: hidden; padding-top: max(12px, env(safe-area-inset-top)); padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+        .add-content-dialog.ocr-editor-expanded .import-options, .add-content-dialog.ocr-editor-expanded .ocr-choices, .add-content-dialog.ocr-editor-expanded .ocr-crop-stage, .add-content-dialog.ocr-editor-expanded .ocr-crop-actions, .add-content-dialog.ocr-editor-expanded .ocr-crop-hint, .add-content-dialog.ocr-editor-expanded .ocr-actions, .add-content-dialog.ocr-editor-expanded #ocrProgress, .add-content-dialog.ocr-editor-expanded #importStatus { display: none; }
+        .add-content-dialog.ocr-editor-expanded .ocr-import { flex: 1; min-height: 0; overflow: hidden; }
+        .add-content-dialog.ocr-editor-expanded #ocrText { flex: 1; min-height: 0; overflow: auto; resize: none; }
+        .add-content-dialog.ocr-editor-expanded #ocrApply { flex: 0 0 auto; position: sticky; bottom: 0; margin-top: 0; }
         .mini-player { display: flex; align-items: center; gap: 10px; min-height: 58px; flex: 0 0 auto; padding: 7px 10px; border: 1px solid var(--surface-light); border-radius: 16px; background: var(--surface); }
         .mini-player[hidden] { display: none; }
         .mini-player-main { display: flex; flex: 1 1 auto; min-width: 0; flex-direction: column; gap: 2px; cursor: pointer; }
@@ -325,11 +350,30 @@ HTML_PAGE = """
             </form>
             <section class="ocr-import" id="ocrImport" aria-label="Rozpoznawanie tekstu ze zdjęcia" hidden>
                 <div class="ocr-choices"><button type="button" id="ocrCameraButton" onclick="window.chooseOcrPhoto('camera')">Zrób zdjęcie</button><button type="button" id="ocrGalleryButton" onclick="window.chooseOcrPhoto('gallery')">Wybierz z galerii</button></div>
-                <canvas id="ocrPreview" aria-label="Podgląd wybranego zdjęcia" hidden></canvas>
+                <strong class="ocr-crop-hint" id="ocrCropTitle" hidden>Przytnij zdjęcie (opcjonalnie)</strong>
+                <div class="ocr-crop-stage" id="ocrCropStage" hidden>
+                    <div class="ocr-crop-surface" id="ocrCropSurface">
+                        <canvas id="ocrPreview" aria-label="Podgląd wybranego zdjęcia" hidden></canvas>
+                        <div class="ocr-crop-selection" id="ocrCropSelection" aria-label="Zaznaczony kadr">
+                            <button type="button" data-crop-handle="nw" aria-label="Zmień lewy górny róg kadru"></button>
+                            <button type="button" data-crop-handle="n" aria-label="Zmień górną krawędź kadru"></button>
+                            <button type="button" data-crop-handle="ne" aria-label="Zmień prawy górny róg kadru"></button>
+                            <button type="button" data-crop-handle="e" aria-label="Zmień prawą krawędź kadru"></button>
+                            <button type="button" data-crop-handle="se" aria-label="Zmień prawy dolny róg kadru"></button>
+                            <button type="button" data-crop-handle="s" aria-label="Zmień dolną krawędź kadru"></button>
+                            <button type="button" data-crop-handle="sw" aria-label="Zmień lewy dolny róg kadru"></button>
+                            <button type="button" data-crop-handle="w" aria-label="Zmień lewą krawędź kadru"></button>
+                            <button type="button" data-crop-handle="move" aria-label="Przesuń kadr">Przesuń</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="ocr-crop-actions" id="ocrCropActions" hidden><button type="button" id="ocrApplyCrop" onclick="window.applyOcrCrop()" disabled>Zastosuj kadr</button><button type="button" id="ocrResetCrop" onclick="window.resetOcrCrop()" disabled>Całe zdjęcie</button></div>
+                <small class="ocr-crop-hint" id="ocrCropHint" hidden>Przesuń kadr środkowym uchwytem albo zmień jego krawędzie. Długi obraz przewijaj poza uchwytami. Wybierz „Całe zdjęcie”, aby pominąć kadrowanie.</small>
                 <div class="import-status" id="ocrStatus" role="status" aria-live="polite">Wybierz jedno zdjęcie. Rozpoznawanie odbywa się na telefonie.</div>
                 <progress id="ocrProgress" max="100" value="0" aria-label="Postęp rozpoznawania" hidden></progress>
                 <div class="ocr-actions"><button type="button" id="ocrRun" onclick="window.runOcr()" disabled>Rozpoznaj tekst</button><button type="button" id="ocrCancel" onclick="window.cancelOcrRecognition()" disabled>Anuluj</button></div>
                 <label for="ocrText" id="ocrTextLabel" hidden>Popraw rozpoznany tekst</label>
+                <button type="button" id="ocrExpand" aria-expanded="false" onclick="window.toggleOcrEditor()" hidden>Rozwiń edytor</button>
                 <textarea id="ocrText" aria-labelledby="ocrTextLabel" spellcheck="true" hidden></textarea>
                 <button class="apply-btn" type="button" id="ocrApply" onclick="window.applyOcrText()" hidden>✔️ Czytaj tekst</button>
             </section>
