@@ -914,6 +914,7 @@ HTML_PAGE = """
         } else if (state.pendingAppend) {
             const appended = state.pendingAppend;
             state.pendingAppend = null;
+            state.waitingForData = false;
             const end = streamBufferedEnd(sourceBuffer);
             const start = state.timelineEnd;
             if (!Number.isFinite(end) || end <= start + 0.001) {
@@ -1001,9 +1002,13 @@ HTML_PAGE = """
 
     function handleContinuousWaiting(state) {
         if (!streamStateIsCurrent(state)) return;
+        const bufferedEnd = streamBufferedEnd(state.sourceBuffer);
+        const remaining = bufferedEnd - state.player.currentTime;
+        const nearBufferEnd = remaining <= Math.max(0.5, (state.player.playbackRate || 1) * 0.5);
+        state.waitingForData = nearBufferEnd;
         trace('stream_waiting', {fragment: state.currentIndex,
-            buffered_seconds: Math.max(0, streamBufferedEnd(state.sourceBuffer) - state.player.currentTime)});
-        if (state.pendingFailure) {
+            buffered_seconds: Math.max(0, remaining), boundary_demand: nearBufferEnd});
+        if (state.pendingFailure && nearBufferEnd) {
             const failure = state.pendingFailure;
             state.pendingFailure = null;
             streamFail(state, failure.error, failure.idx);
@@ -1019,12 +1024,16 @@ HTML_PAGE = """
             while (streamStateIsCurrent(state) && !state.sourceBuffer.updating) {
                 const idx = state.nextAppendIdx;
                 if (idx >= sentences.length) break;
-                if (idx > state.currentIndex + bufferMode) break;
+                // In buffer=0 mode only synthesize the next sentence after the
+                // media element reports starvation. timeupdate may lag the edge.
+                const boundaryDemand = bufferMode === 0 && state.waitingForData &&
+                    idx === state.currentIndex + 1;
+                if (idx > state.currentIndex + bufferMode && !boundaryDemand) break;
                 if (!sentences[idx].trim()) {
                     state.nextAppendIdx++;
                     continue;
                 }
-                const audioUrl = await fetchAudioBlob(idx, controller.signal, idx === state.currentIndex);
+                const audioUrl = await fetchAudioBlob(idx, controller.signal, idx === state.currentIndex || boundaryDemand);
                 if (!streamStateIsCurrent(state)) return;
                 if (!audioUrl) throw new Error('Brak miejsca na fragment audio.');
                 const job = [...prefetchCache.values()].find(candidate => candidate.url === audioUrl);
@@ -1041,6 +1050,11 @@ HTML_PAGE = """
             if (!streamStateIsCurrent(state) || error?.name === 'AbortError') return;
             const failedIndex = state.nextAppendIdx;
             if (state.appended.length) {
+                if (state.waitingForData) {
+                    state.waitingForData = false;
+                    streamFail(state, error, failedIndex);
+                    return;
+                }
                 state.pendingFailure = {idx: failedIndex, error};
                 trace('stream_error_waiting_for_buffer_end', {fragment: failedIndex, code: error?.name || 'stream_error'});
             } else streamFail(state, error, failedIndex);
@@ -1084,7 +1098,8 @@ HTML_PAGE = """
             state = {token: session, player: audio, mediaSource, sourceBuffer: null, objectUrl: null,
                 currentIndex: idx, nextAppendIdx: idx, appended: [], timelineEnd: 0, bufferedBytes: 0,
                 lastRemovedTo: 0, pendingAppend: null, pendingRemove: null, pendingFailure: null,
-                pumping: false, playCalled: false, started: false, ended: false, cancelled: false};
+                pumping: false, playCalled: false, started: false, ended: false, cancelled: false,
+                waitingForData: false};
             continuousPlayback = state;
             activePlayback = null;
             state.objectUrl = URL.createObjectURL(mediaSource);
@@ -1255,6 +1270,8 @@ HTML_PAGE = """
             setMediaPlaybackState('playing');
             document.getElementById('playBtn').innerText = '⏸';
             if (continuousPlayback && continuousPlayback.token === session) {
+                // Resume background synthesis jobs that could not run while paused.
+                pumpQueue();
                 if (continuousPlayback.playCalled) {
                     continuousPlayback.player.play().catch(error => streamFail(continuousPlayback, error, currentIdx));
                 } else pumpContinuous(continuousPlayback);

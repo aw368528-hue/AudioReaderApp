@@ -912,10 +912,47 @@ test('MOB-06: buffer=0 czeka na koniec bieżącego bufora przed dopisaniem nast�
     const player = h.audios.at(-1);
     assert.equal(h.sourceBuffers[0].ranges.length, 1);
     assert.equal(h.sourceBuffers[0].mode, 'sequence');
-    h.run('audio.currentTime=10; audio.ontimeupdate()'); await settle();
-    assert.equal(h.sourceBuffers[0].ranges.length, 2);
-    assert.equal(h.run('currentIdx'), 1);
-    assert.equal(player.plays, 1);
+    h.run('audio.currentTime=9; audio.ontimeupdate(); audio.onwaiting()'); await settle();
+    assert.equal(h.sourceBuffers[0].ranges.length, 1, 'waiting well before buffer end must not prefetch');
+    h.run('audio.currentTime=9.7; audio.ontimeupdate()'); await settle();
+    assert.equal(h.sourceBuffers[0].ranges.length, 1, 'timeupdate before the edge still must not prefetch');
+    h.run('audio.onwaiting()'); await settle();
+    assert.equal(h.run('diagnosticReport().stream.buffered_seconds'), 10.3);
+    assert.equal(h.sourceBuffers[0].ranges.length, 2, 'waiting near the buffered edge must demand the next MP3 without an exact-boundary timeupdate');
+    assert.equal(player.plays, 1, 'MSE resumes the same playback without another play() call');
+    assert.equal(player.paused, false);
+    assert.equal(h.run('currentIdx'), 0, 'the delayed timeupdate has not crossed the sentence boundary');
+});
+test('MOB-06: błąd TTS po wyczerpaniu bufora natychmiast uruchamia ograniczony fallback', async () => {
+    let calls = 0;
+    const h = harness(async()=>++calls === 1 ? ok() : failed(400), '?test=1&buffer=0', true, true);
+    h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+    h.run('audio.currentTime=9.7; audio.ontimeupdate(); audio.onwaiting()'); await settle();
+    assert.equal(h.run('diagnosticReport().stream.mode'), 'fallback');
+    assert.ok(h.run('diagnosticReport().events.some(event=>event.type==="stream_fallback")'), 'legacy fallback path is entered');
+    assert.equal(calls, 3, 'one successful MSE fragment, one failed next fragment and one bounded fallback request');
+    assert.equal(h.run('isReading'), false, 'a second TTS failure stops instead of retrying without limit');
+    h.run('window.stopReading()');
+});
+test('MOB-06: wznowienie odblokowuje syntezę tła zatrzymaną przez pauzę', async () => {
+    let finishFirst;
+    let calls = 0;
+    const h = harness(async()=>{
+        calls++;
+        if (calls === 1) return new Promise(resolve=>{finishFirst=()=>resolve(ok());});
+        return ok();
+    }, '?test=1&buffer=2', true, true);
+    h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+    h.run('window.togglePlay()');
+    finishFirst(); await settle();
+    assert.equal(h.sourceBuffers[0].ranges.length, 1);
+    assert.equal(h.run('isPaused'), true);
+    h.run('window.togglePlay()'); await settle();
+    assert.equal(h.run('isPaused'), false);
+    assert.equal(h.sourceBuffers[0].ranges.length, 2, 'the queued background TTS job resumes and appends');
+    assert.equal(calls, 2);
+    h.run('window.stopReading()');
+    assert.equal(h.run('isReading'), false, 'stop ends the resumed stream session');
 });
 test('MOB-06: brak obsługi MSE, addSourceBuffer lub append bezpiecznie przechodzi na audio Blob', async () => {
     for (const support of [false, 'add_error', 'append_error']) {
