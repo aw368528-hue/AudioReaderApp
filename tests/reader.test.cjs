@@ -5,54 +5,93 @@ const script = fs.readFileSync(0, 'utf8');
 async function settle() { for (let n = 0; n < 12; n++) await new Promise(r => setTimeout(r, 1)); }
 const ok = () => ({ok: true, blob: async () => ({size: 10, arrayBuffer: async () => new ArrayBuffer(10)})});
 const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
+function latestDocument(idb) { return [...idb.data.values()].filter(item=>item.id!=='last')
+    .sort((a,b)=>(b.lastUsedAt||b.savedAt||0)-(a.lastUsedAt||a.savedAt||0))[0]; }
+function namedDocument(idb, name) { return [...idb.data.values()].find(item=>item.name===name); }
 function memoryIndexedDB() {
     const data = new Map();
-    const control = {data, failWrites: 0, holdNextReadwriteGet: false, releaseHeldRead: null};
+    const sessions = new Map();
+    const stores = new Map([['documents', data]]);
+    const control = {data, sessions, stores, failWrites: 0, holdNextReadwriteGet: false, releaseHeldRead: null,
+        holdReadonlyGetKey: null, releaseHeldReadonlyGet: null, holdNextReadwriteDelete: false, releaseHeldDelete: null,
+        oldVersion: 0, simulateUpgradeAbort: false};
+    function objectStore(name, mode, tx) {
+        const records = stores.get(name);
+        return {
+            indexNames: {contains: () => false}, createIndex() {},
+            get(key) {
+                const request = {};
+                const run = () => schedule(() => { request.result = records.get(key) || null; request.onsuccess?.(); }, tx);
+                if (mode === 'readwrite' && control.holdNextReadwriteGet) {
+                    control.holdNextReadwriteGet = false;
+                    control.releaseHeldRead = run;
+                } else if (mode === 'readonly' && control.holdReadonlyGetKey === key) {
+                    control.holdReadonlyGetKey = null;
+                    control.releaseHeldReadonlyGet = run;
+                } else run();
+                return request;
+            },
+            getAll() {
+                const request = {};
+                schedule(() => { request.result = Array.from(records.values()); request.onsuccess?.(); }, tx);
+                return request;
+            },
+            put(record) {
+                const request = {};
+                schedule(() => {
+                    if (control.failWrites) {
+                        control.failWrites--;
+                        tx.error = Object.assign(new Error('quota exceeded'), {name: 'QuotaExceededError'});
+                        tx.onerror?.(); tx.onabort?.(); request.onerror?.();
+                    } else { records.set(record.id, JSON.parse(JSON.stringify(record))); request.result = record.id; request.onsuccess?.(); }
+                }, tx);
+                return request;
+            },
+            delete(key) {
+                const run=()=>schedule(()=>{records.delete(key);},tx);
+                if (mode !== 'readonly' && control.holdNextReadwriteDelete) {
+                    control.holdNextReadwriteDelete=false;
+                    control.releaseHeldDelete=run;
+                } else run();
+            }
+        };
+    }
+    function schedule(callback, tx) {
+        tx.pending++;
+        setTimeout(() => { callback(); tx.pending--; completeWhenIdle(tx); }, 0);
+    }
+    function completeWhenIdle(tx) {
+        if (!tx.pending && !tx.completionScheduled) {
+            tx.completionScheduled=true;
+            setTimeout(() => { tx.completionScheduled=false; if (!tx.pending) tx.oncomplete?.(); }, 0);
+        }
+    }
     const db = {
-        objectStoreNames: {contains: name => name === 'documents'},
-        createObjectStore() {},
+        objectStoreNames: {contains: name => stores.has(name)},
+        createObjectStore(name) { const map=new Map(); stores.set(name,map); if(name==='documents')control.data=map;if(name==='sessions')control.sessions=map; return objectStore(name,'versionchange',{pending:0}); },
         transaction(name, mode) {
-            assert.equal(name, 'documents');
-            const tx = {error: null};
-            let pending = 0;
-            const completeWhenIdle = () => {
-                if (!pending) setTimeout(() => { if (!pending) tx.oncomplete?.(); }, 0);
-            };
-            const schedule = callback => {
-                pending++;
-                setTimeout(() => { callback(); pending--; completeWhenIdle(); }, 0);
-            };
-            tx.objectStore = () => ({
-                get(key) {
-                    const request = {};
-                    const run = () => schedule(() => { request.result = data.get(key) || null; request.onsuccess?.(); });
-                    if (mode === 'readwrite' && control.holdNextReadwriteGet) {
-                        control.holdNextReadwriteGet = false;
-                        control.releaseHeldRead = run;
-                    } else run();
-                    return request;
-                },
-                put(record) {
-                    schedule(() => {
-                        if (control.failWrites) {
-                            control.failWrites--;
-                            tx.error = Object.assign(new Error('quota exceeded'), {name: 'QuotaExceededError'});
-                            tx.onerror?.(); tx.onabort?.();
-                        } else data.set(record.id, JSON.parse(JSON.stringify(record)));
-                    });
-                },
-                delete(key) { schedule(() => { data.delete(key); }); }
-            });
+            const tx = {error: null, pending:0, completionScheduled:false, objectStore: storeName => objectStore(storeName,mode,tx)};
+            setTimeout(()=>completeWhenIdle(tx),0);
             return tx;
         }
+    };
+    const upgradeTx = {error:null,pending:0,completionScheduled:false,objectStore: storeName=>objectStore(storeName,'versionchange',upgradeTx)};
+    db.createObjectStore = (name, options) => {
+        const map=new Map(); stores.set(name,map); if(name==='documents')control.data=map;if(name==='sessions')control.sessions=map;
+        return {indexNames:{contains:()=>false},createIndex(){}, ...objectStore(name,'versionchange',upgradeTx)};
     };
     let upgraded = false;
     return Object.assign(control, {open() {
         const request = {};
+        request.transaction=upgradeTx;
+        request.oldVersion=control.oldVersion || (data.has('last') ? 1 : 0);
         setTimeout(() => {
             request.result = db;
-            if (!upgraded) { upgraded = true; request.onupgradeneeded?.(); }
-            request.onsuccess?.();
+            if (!upgraded && !control.simulateUpgradeAbort) { upgraded = true; request.onupgradeneeded?.({oldVersion:request.oldVersion}); }
+            setTimeout(()=>{
+                if (control.simulateUpgradeAbort) { upgraded=false; request.onerror?.(); return; }
+                request.onsuccess?.();
+            }, 5);
         }, 0);
         return request;
     }});
@@ -140,7 +179,7 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
     context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
     context.document.getElementById('rateSlider').value = '0';
     return {run, context, elements, audios, delays, revoked, created, documentListeners, windowListeners, mediaSession, mediaActions, mediaSources, sourceBuffers, indexedDBApi,
-        advance(ms) { performanceTime += ms; }};
+        advance(ms) { performanceTime += ms; }, setNow(ms) { now=ms; }};
 }
 const cases = [];
 function test(name, fn) { cases.push([name, fn]); }
@@ -846,7 +885,7 @@ test('Kontrola po powrocie wykrywa brak postępu currentTime', async () => {
 test('Zdarzenia odtwarzacza są wyłączone bez test=1', async () => {
     const h = harness(async()=>ok(), '?test=0');
     assert.equal(h.run('diagnostics'), null);
-    assert.deepEqual(Object.keys(h.audios[0].listeners), ['pause']);
+    assert.deepEqual(Object.keys(h.audios[0].listeners), ['playing', 'pause']);
     assert.equal(h.run('diagnosticReport()'), null);
 });
 test('MOB-05 odzyskuje jedną wczesną pauzę w tle dla fragmentów 2 i 4 z buffer=2', async () => {
@@ -1238,6 +1277,215 @@ test('Usunięcie udanego audio nie daje nieskończonych prób po nowym błędzie
     assert.equal(calls,4);
     assert.equal(h.run('session'),token);
 });
+test('UX-02 atomowo migruje pełny rekord UX-01 i po przerwaniu można ponowić migrację', async () => {
+    const idb=memoryIndexedDB();
+    const legacy={id:'last',version:1,segmentationVersion:1,text:'Pierwsze. Drugie.',name:'migracja.txt',blocks:[],
+        sentenceCount:2,index:1,completed:false,voice:'pl-PL-MarekNeural',rate:'20',savedAt:1234};
+    idb.data.set('last',legacy);
+    idb.simulateUpgradeAbort=true;
+    const interrupted=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    assert.deepEqual(idb.data.get('last'),legacy,'legacy row remains untouched when upgrade is interrupted');
+    assert.equal(interrupted.run('isReading'),false);
+    idb.simulateUpgradeAbort=false;
+    const reopened=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    const migrated=idb.data.get('doc_migrated_v1_last');
+    assert.equal(idb.data.has('last'),false);
+    assert.equal(migrated.text,legacy.text);
+    assert.deepEqual(migrated.blocks,legacy.blocks);
+    assert.equal(migrated.index,1);
+    assert.equal(migrated.completed,false);
+    assert.equal(migrated.voice,legacy.voice);
+    assert.equal(migrated.rate,legacy.rate);
+    assert.equal(reopened.run('currentIdx'),1);
+    assert.equal(reopened.run('currentDocument.id'),'doc_migrated_v1_last');
+    assert.equal(reopened.run('isReading'),false,'migration never starts audio');
+    assert.equal(idb.sessions.size,0,'no history is inferred for UX-01 data');
+});
+test('UX-02 zapisuje odsłuch dopiero na playing i grupuje pauzę ze wznowieniem', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.context.document.getElementById('rawText').value='Pierwsze zdanie.';
+    h.run('window.applyText()'); await settle();
+    h.run("window.switchTab('history')"); await settle();
+    assert.equal(idb.sessions.size,0,'upload, apply, and opening history do not create a session');
+    h.run('window.startFrom(0)'); await settle();
+    assert.equal(idb.sessions.size,0,'play() preparation is not actual playback');
+    h.run('audio.dispatch("playing")'); await settle();
+    assert.equal(idb.sessions.size,1);
+    let item=[...idb.sessions.values()][0];
+    assert.equal(item.status,'playing');
+    assert.equal(item.documentId,h.run('currentDocument.id'));
+    const startedAt=item.startedAt;
+    h.run('audio.paused=true; audio.dispatch("pause")'); await settle();
+    assert.equal([...idb.sessions.values()][0].status,'paused');
+    h.run('window.togglePlay()'); await settle();
+    h.run('audio.dispatch("playing")'); await settle();
+    assert.equal(idb.sessions.size,1,'resume remains in the same grouped session');
+    item=[...idb.sessions.values()][0];
+    assert.equal(item.startedAt,startedAt);
+    assert.equal(item.status,'playing');
+    h.run('window.stopReading()'); await settle();
+    assert.equal([...idb.sessions.values()][0].status,'stopped');
+    assert.equal([...idb.sessions.values()][0].playedMs>=0,true);
+});
+test('UX-02 Media Session respektuje pauzę systemową, koniec i pagehide', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Koniec dokumentu.",[],{name:"media.txt"}); window.startFrom(0)'); await settle();
+    h.audios.at(-1).dispatch('playing'); await settle();
+    const first=[...idb.sessions.values()][0].id;
+    h.mediaActions.pause(); await settle();
+    assert.equal([...idb.sessions.values()][0].status,'paused');
+    h.mediaActions.play(); await settle();
+    h.audios.at(-1).dispatch('playing'); await settle();
+    assert.equal([...idb.sessions.values()][0].id,first);
+    h.run('audio.onended()'); await settle();
+    assert.equal([...idb.sessions.values()][0].status,'completed');
+
+    h.run('window.startFrom(0)'); await settle();
+    h.audios.at(-1).dispatch('playing'); await settle();
+    h.windowListeners.pagehide(); await settle();
+    assert.equal([...idb.sessions.values()].find(item=>item.id!==first).status,'interrupted');
+});
+test('UX-02 dwa dokumenty zachowują niezależny postęp i usunięcie kasuje ich historię', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Pierwsze. Drugie.",[],{name:"jeden.txt"})'); await settle();
+    const firstId=h.run('currentDocument.id');
+    h.run('window.startFrom(1)'); await settle();
+    h.run('renderSentences("Drugi dokument.",[],{name:"dwa.txt"})'); await settle();
+    const secondId=h.run('currentDocument.id');
+    assert.notEqual(firstId,secondId);
+    await h.run(`openLibraryDocument(${JSON.stringify(firstId)})`); await settle();
+    assert.equal(h.run('currentDocument.id'),firstId);
+    assert.equal(h.run('currentIdx'),1);
+    h.run('window.startFrom(1)'); await settle();
+    h.run('audio.dispatch("playing")'); await settle();
+    assert.equal(idb.sessions.size,1);
+    await h.run(`deleteLibraryDocument(${JSON.stringify(firstId)})`); await settle();
+    assert.equal(idb.data.has(firstId),false);
+    assert.equal([...idb.sessions.values()].some(item=>item.documentId===firstId),false);
+});
+test('UX-02 opóźnione usunięcie A nie czyści ani nie nadpisuje nowo otwartego B', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Dokument A.",[],{name:"A.txt"})'); await settle();
+    const idA=h.run('currentDocument.id');
+    h.run('renderSentences("Dokument B.",[],{name:"B.txt"})'); await settle();
+    const idB=h.run('currentDocument.id');
+    await h.run(`openLibraryDocument(${JSON.stringify(idA)})`); await settle();
+    idb.holdNextReadwriteDelete=true;
+    const deletion=h.run(`deleteLibraryDocument(${JSON.stringify(idA)})`);
+    await settle();
+    assert.equal(typeof idb.releaseHeldDelete,'function','delete transaction is paused before completion');
+    await h.run(`openLibraryDocument(${JSON.stringify(idB)})`); await settle();
+    assert.equal(h.run('currentDocument.id'),idB);
+    idb.releaseHeldDelete();
+    await deletion; await settle();
+    assert.equal(h.run('currentDocument.id'),idB,'late delete completion cannot clear the newer reader document');
+    assert.equal(h.run('currentDocument.text'),'Dokument B.');
+    assert.equal(idb.data.has(idB),true,'newly opened B remains stored after queued writes settle');
+    assert.equal(idb.data.has(idA),false);
+});
+test('UX-02 spóźniony odczyt biblioteki i import nie nadpisują nowszego wyboru', async () => {
+    const idb=memoryIndexedDB();
+    let finishImport;
+    const h=harness(async url=>url==='/upload'
+        ? new Promise(resolve=>{finishImport=resolve;}) : ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Dokument A.",[],{name:"A.txt"})'); await settle();
+    const idA=h.run('currentDocument.id');
+    h.run('renderSentences("Dokument B.",[],{name:"B.txt"})'); await settle();
+    const idB=h.run('currentDocument.id');
+    idb.holdReadonlyGetKey=idA;
+    const openA=h.run(`openLibraryDocument(${JSON.stringify(idA)})`);
+    await settle();
+    assert.equal(typeof idb.releaseHeldReadonlyGet,'function','A library read is deliberately delayed');
+    await h.run(`openLibraryDocument(${JSON.stringify(idB)})`); await settle();
+    idb.releaseHeldReadonlyGet();
+    await openA; await settle();
+    assert.equal(h.run('currentDocument.id'),idB,'older library selection cannot replace the newer selection');
+
+    const file=new Blob(['input']); file.name='spozniony.txt';
+    const pendingImport=h.context.document.getElementById('fileInput').listeners.change({target:{files:[file]}});
+    await settle();
+    await h.run(`openLibraryDocument(${JSON.stringify(idA)})`); await settle();
+    finishImport({ok:true,json:async()=>({text:'Późny import.',blocks:[]})});
+    await pendingImport; await settle();
+    assert.equal(h.run('currentDocument.id'),idA,'late import cannot replace the newer library choice');
+    assert.equal([...idb.data.values()].some(item=>item.name==='spozniony.txt'),false);
+});
+test('UX-02 spóźnione playing starego odtwarzacza nie zapisuje sesji nowego dokumentu', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Dokument A.",[],{name:"A.txt"}); window.startFrom(0)'); await settle();
+    const oldPlayer=h.audios.at(-1);
+    h.run('renderSentences("Dokument B.",[],{name:"B.txt"})'); await settle();
+    const idB=h.run('currentDocument.id');
+    oldPlayer.dispatch('playing'); await settle();
+    assert.equal(idb.sessions.size,0,'a detached player event does not create an entry');
+    h.run('window.startFrom(0)'); await settle();
+    h.audios.at(-1).dispatch('playing'); await settle();
+    assert.equal(idb.sessions.size,1);
+    assert.equal([...idb.sessions.values()][0].documentId,idB,'only actual playback of B is recorded');
+});
+test('UX-02 jeden dokument pojawia się w historii dwóch lokalnych dni', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Dokument do historii.",[],{name:"historia.txt"})'); await settle();
+    const docId=h.run('currentDocument.id');
+    h.setNow(Date.parse('2026-11-01T23:30:00Z'));
+    h.run('window.startFrom(0)'); await settle();
+    h.audios.at(-1).dispatch('playing'); await settle();
+    h.run('window.stopReading()'); await settle();
+    h.setNow(Date.parse('2026-11-02T23:30:00Z'));
+    h.run('window.startFrom(0)'); await settle();
+    h.audios.at(-1).dispatch('playing'); await settle();
+    h.run('window.stopReading()'); await settle();
+    const entries=[...idb.sessions.values()].filter(item=>item.documentId===docId);
+    assert.equal(entries.length,2);
+    assert.deepEqual(entries.map(item=>h.run(`dateKey(${item.startedAt})`)),['2026-11-02','2026-11-03']);
+});
+test('UX-02 limit 10 dokumentów rotuje najstarszy, ale zachowuje nowy aktywny', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    for(let i=0;i<11;i++) {
+        h.run(`renderSentences("Dokument ${i}.",[],{name:"${i}.txt"})`);
+        await settle();
+    }
+    assert.equal(idb.data.size,10);
+    assert.ok(idb.data.has(h.run('currentDocument.id')),'active document is never evicted');
+    assert.equal([...idb.data.values()].some(item=>item.name==='0.txt'),false,'least recently used item rotated out');
+});
+test('UX-02 MSE zachowuje jedną sesję mimo granicy fragmentu', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,true,idb);
+    await settle();
+    h.run('renderSentences("Pierwsze. Drugie.",[],{name:"mse.txt"}); window.startFrom(0)'); await settle();
+    const player=h.audios.at(-1);
+    player.dispatch('playing'); await settle();
+    const id=[...idb.sessions.values()][0].id;
+    h.run('audio.currentTime=10; audio.ontimeupdate()'); await settle();
+    assert.equal(h.run('currentIdx'),1);
+    assert.equal(idb.sessions.size,1);
+    assert.equal([...idb.sessions.values()][0].id,id);
+    h.run('window.stopReading()'); await settle();
+});
+test('UX-02 kalendarz używa poniedziałku jako pierwszego dnia i daty lokalnej', () => {
+    const h=harness(async()=>ok());
+    assert.equal(h.run('dateKey(new Date(2026, 10, 15))'), '2026-11-15');
+    assert.equal(h.run('((new Date(2026, 10, 1).getDay()+6)%7)'), 6, 'Sunday is placed after Saturday in Monday-first calendar');
+    assert.match(h.run('formatLocalDate("2026-11-15")'), /listopada/);
+});
 test('UX-01 wklejony tekst i miejsce wracają lokalnie bez automatycznego odtwarzania', async () => {
     const idb = memoryIndexedDB();
     const h = harness(async()=>ok(), '', true, null, idb);
@@ -1246,13 +1494,13 @@ test('UX-01 wklejony tekst i miejsce wracają lokalnie bez automatycznego odtwar
     h.context.document.getElementById('rateSlider').value = '20';
     h.context.document.getElementById('rawText').value = 'Pierwsze zdanie. Drugie zdanie.';
     h.run('window.applyText()'); await settle();
-    assert.equal(idb.data.get('last').name, 'Wklejony tekst');
-    assert.equal(idb.data.get('last').text, 'Pierwsze zdanie. Drugie zdanie.');
+    assert.equal(latestDocument(idb).name, 'Wklejony tekst');
+    assert.equal(latestDocument(idb).text, 'Pierwsze zdanie. Drugie zdanie.');
     h.run('window.startFrom(1)'); await settle();
     h.run('window.togglePlay()'); await settle();
-    assert.equal(idb.data.get('last').index, 1);
-    assert.equal(idb.data.get('last').voice, 'pl-PL-MarekNeural');
-    assert.equal(idb.data.get('last').rate, '20');
+    assert.equal(latestDocument(idb).index, 1);
+    assert.equal(latestDocument(idb).voice, 'pl-PL-MarekNeural');
+    assert.equal(latestDocument(idb).rate, '20');
 
     let reopenedFetches = 0;
     const reopened = harness(async()=>{reopenedFetches++; return ok();}, '', true, null, idb);
@@ -1287,7 +1535,7 @@ test('UX-01 import zapisuje nazwę i bloki; nieudany następny import zachowuje 
     const firstFile = new Blob(['pdf']); firstFile.name = 'raport.pdf';
     h.context.document.getElementById('fileInput').listeners.change({target:{files:[firstFile]}});
     await settle();
-    const saved = JSON.parse(JSON.stringify(idb.data.get('last')));
+    const saved = JSON.parse(JSON.stringify(namedDocument(idb, 'raport.pdf')));
     assert.equal(saved.name, 'raport.pdf');
     assert.notEqual(saved.text, 'Stary zapis.', 'a successful new import replaces the prior remembered document');
     assert.deepEqual(saved.blocks, [{start:0,end:10,kind:'heading'}]);
@@ -1295,7 +1543,7 @@ test('UX-01 import zapisuje nazwę i bloki; nieudany następny import zachowuje 
     const secondFile = new Blob(['bad']); secondFile.name = 'bad.pdf';
     h.context.document.getElementById('fileInput').listeners.change({target:{files:[secondFile]}});
     await settle();
-    assert.deepEqual(idb.data.get('last'), saved, 'failed import leaves the known-good local document untouched');
+    assert.deepEqual(latestDocument(idb), saved, 'failed import leaves the known-good local document untouched');
     assert.equal(imports, 2, 'local save/restore causes no extra upload request');
 });
 test('UX-01 spóźniony zapis poprzedniego dokumentu nie nadpisuje aktualnego', async () => {
@@ -1307,8 +1555,8 @@ test('UX-01 spóźniony zapis poprzedniego dokumentu nie nadpisuje aktualnego', 
     h.context.document.getElementById('rawText').value = 'Dokument aktualny.';
     h.run('window.applyText()');
     await settle();
-    assert.equal(idb.data.get('last').text, 'Dokument aktualny.');
-    assert.equal(idb.data.get('last').name, 'Wklejony tekst');
+    assert.equal(latestDocument(idb).text, 'Dokument aktualny.');
+    assert.equal(latestDocument(idb).name, 'Wklejony tekst');
 });
 test('UX-01 przejście zdania w MSE zapisuje indeks bez zmiany streamu', async () => {
     const idb = memoryIndexedDB();
@@ -1319,7 +1567,7 @@ test('UX-01 przejście zdania w MSE zapisuje indeks bez zmiany streamu', async (
     const source = player.src;
     h.run('audio.currentTime=10; audio.ontimeupdate()'); await settle();
     assert.equal(h.run('currentIdx'), 1);
-    assert.equal(idb.data.get('last').index, 1);
+    assert.equal(latestDocument(idb).index, 1);
     assert.equal(player.src, source);
     assert.equal(player.plays, 1, 'saving resume position does not restart the MSE stream');
     h.run('window.stopReading()');
@@ -1332,8 +1580,8 @@ test('UX-01 końcówka dokumentu zapisuje ukończenie i pozwala zacząć od pocz
     h.run('window.applyText()'); await settle();
     h.run('window.startFrom(0)'); await settle();
     h.run('audio.onended()'); await settle();
-    assert.equal(idb.data.get('last').completed, true);
-    assert.equal(idb.data.get('last').index, 1);
+    assert.equal(latestDocument(idb).completed, true);
+    assert.equal(latestDocument(idb).index, 1);
     const reopened = harness(async()=>ok(), '', true, null, idb);
     await settle();
     assert.equal(reopened.run('isReading'), false);
@@ -1366,9 +1614,9 @@ test('UX-01 opóźnione czyszczenie starego rekordu nie usuwa nowego dokumentu',
     h.run('renderSentences("Nowy dokument.", [], {name:"nowy.txt"})');
     idb.releaseHeldRead();
     await settle();
-    assert.equal(idb.data.get('last').text, 'Nowy dokument.');
-    assert.equal(idb.data.get('last').name, 'nowy.txt');
-    assert.equal(idb.data.get('last').segmentationVersion, 1);
+    assert.equal(latestDocument(idb).text, 'Nowy dokument.');
+    assert.equal(latestDocument(idb).name, 'nowy.txt');
+    assert.equal(latestDocument(idb).segmentationVersion, 1);
 });
 test('UX-01 usuń czyści dokument i nie zapisuje go ponownie podczas stopu', async () => {
     const idb = memoryIndexedDB();
@@ -1376,12 +1624,12 @@ test('UX-01 usuń czyści dokument i nie zapisuje go ponownie podczas stopu', as
     await settle();
     h.context.document.getElementById('rawText').value = 'Do usunięcia.';
     h.run('window.applyText()'); await settle();
-    assert.equal(idb.data.has('last'), true);
+    assert.ok(latestDocument(idb));
     h.run('window.deleteSavedDocument()'); await settle();
-    assert.equal(idb.data.has('last'), false);
+    assert.equal(idb.data.size, 0);
     h.run('window.startFrom(0)'); await settle();
     h.run('window.stopReading()'); await settle();
-    assert.equal(idb.data.has('last'), false, 'deleted content and position stay deleted for the current document');
+    assert.equal(idb.data.size, 0, 'deleted content and position stay deleted for the current document');
 });
 test('UX-01 brak IndexedDB lub quota nie blokuje odtwarzania', async () => {
     const noStorage = harness(async()=>ok());
