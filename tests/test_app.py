@@ -311,6 +311,17 @@ class ReaderTests(unittest.TestCase):
         self.assertIn("createWorker('pol'", script.text)
         self.assertNotIn("fetch('/upload'", script.text)
 
+    def test_ocr_crop_and_mobile_editor_markup(self):
+        page = self.client.get('/').text
+        for control in ('ocrCropStage', 'ocrCropSelection', 'ocrApplyCrop',
+                        'ocrResetCrop', 'ocrExpand', 'ocrText', 'ocrApply'):
+            self.assertIn(f'id="{control}"', page)
+        self.assertIn('data-crop-handle="move"', page)
+        self.assertIn('data-crop-handle="se"', page)
+        self.assertIn('ocr-editor-expanded', page)
+        self.assertIn('env(safe-area-inset-bottom)', page)
+        self.assertIn('--ocr-viewport-height', page)
+
     def test_ui01_mobile_markup_and_responsive_contract(self):
         html = self.client.get('/').text
         self.assertIn('id="tabReader"', html)

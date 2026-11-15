@@ -3,6 +3,9 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const script = fs.readFileSync(0, 'utf8');
 const ocrModule = fs.readFileSync('ocr_prototype/app-ocr.js', 'utf8');
+const cropContext = vm.createContext({});
+vm.runInContext(ocrModule,cropContext);
+const cropGeometry = cropContext.ocrCropGeometry;
 async function settle() { for (let n = 0; n < 12; n++) await new Promise(r => setTimeout(r, 1)); }
 const ok = () => ({ok: true, blob: async () => ({size: 10, arrayBuffer: async () => new ArrayBuffer(10)})});
 const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
@@ -101,7 +104,7 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
     const elements = new Map();
     function element() {
         const classes = new Set();
-        return {value: '', style: {}, innerText: '', innerHTML: '', children: [], hidden: false, attributes: {}, clickCount: 0,
+        return {value: '', style: {setProperty(name,value){this[name]=value;}}, innerText: '', innerHTML: '', children: [], hidden: false, attributes: {}, clickCount: 0,
             classList: {toggle(name, force) { const active=force === undefined ? !classes.has(name) : !!force; if(active)classes.add(name);else classes.delete(name);return active; }, add(name) { classes.add(name); }, remove(...names) { names.forEach(name=>classes.delete(name)); }, contains(name) { return classes.has(name); }},
             listeners: {}, click() { this.clickCount++; this.onclick?.({target:this}); this.listeners.click?.({target:this}); }, remove() {},
             focus() { this.focused = true; }, setAttribute(name,value) { this.attributes[name]=String(value); },
@@ -167,7 +170,8 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
     let now = 0;
     const delays = [];
     class Clock extends Date { static now() { return now; } }
-    const window = {addEventListener(type, callback) { windowListeners[type] = callback; }, ...(indexedDBApi ? {indexedDB: indexedDBApi} : {}),
+    const window = {addEventListener(type, callback) { windowListeners[type] = callback; }, ...(ocrOptions.visualViewport ? {visualViewport:ocrOptions.visualViewport} : {}),
+        ...(indexedDBApi ? {indexedDB: indexedDBApi} : {}),
         ...(ocrOptions.tesseract ? {Tesseract: ocrOptions.tesseract} : {})};
     const context = vm.createContext({window, location: {search: query, origin: 'https://example.test'}, URLSearchParams, Blob, Event,
         navigator: {clipboard: {writeText: async text => { context.copied = text; }}, ...(withMediaSession ? {mediaSession} : {})},
@@ -177,13 +181,20 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
         getElementById(id) {
             if (!elements.has(id)) {
                 const value=element();
-                if (id==='ocrPreview') value.getContext=()=>({fillRect() {},drawImage() {}});
+                if (id==='ocrPreview') {
+                    value.getContext=()=>({fillRect() {},drawImage() {}});
+                    value.getBoundingClientRect=()=>({left:0,top:0,width:360,height:360*value.height/value.width});
+                }
                 elements.set(id,value);
             }
             return elements.get(id);
         },
         head: {appendChild(script) { ocrOptions.onScript?.(script, window); }},
-        createElement: element, querySelectorAll: () => []}, Audio, ...(mseSupport === null ? {} : {MediaSource}), fetch, FormData, AbortController,
+        createElement: tag => {
+            const value=element();
+            if(tag==='canvas')value.getContext=()=>({drawImage(...args){ocrOptions.cropDraws?.push(args);}});
+            return value;
+        }, querySelectorAll: () => []}, Audio, ...(mseSupport === null ? {} : {MediaSource}), fetch, FormData, AbortController,
         createImageBitmap: ocrOptions.createImageBitmap || (async () => ({width:1200,height:800,close() {}})),
         DOMException, TypeError, URL: {createObjectURL: blob => {
             if (blob instanceof MediaSource) { const url=`mse:${mediaSources.length}`; blob.url=url; return url; }
@@ -207,6 +218,20 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
 }
 const cases = [];
 function test(name, fn) { cases.push([name, fn]); }
+test('OCR-01B geometria kadru ogranicza przesuwanie, krawędzie i mapowanie pikseli', () => {
+    const rect={x:.1,y:.2,w:.5,h:.6};
+    const moved=cropGeometry.moveCrop(rect,'move',.7,.5,.1,.1);
+    assert.deepEqual(JSON.parse(JSON.stringify(moved)),{x:.5,y:.4,w:.5,h:.6});
+    const north=cropGeometry.moveCrop(rect,'n',0,.1,.1,.1);
+    assert.ok(Math.abs(north.y-.3)<1e-10);
+    assert.ok(Math.abs(north.h-.5)<1e-10);
+    const narrow=cropGeometry.moveCrop(rect,'w',.9,0,.12,.1);
+    assert.ok(narrow.w>=.12-1e-10,'crop never becomes too narrow');
+    const long=cropGeometry.moveCrop(rect,'s',0,-.9,.1,.04);
+    assert.ok(long.h>=.04-1e-10,'long screenshot keeps a usable crop height');
+    const pixels=cropGeometry.pixelCrop({x:.1,y:.1,w:.8,h:.8},1000,2000);
+    assert.deepEqual(JSON.parse(JSON.stringify(pixels)),{x:100,y:200,w:800,h:1600});
+});
 function segments(text) {
     const h = harness(async () => ok());
     return Array.from(h.run(`splitSentences(${JSON.stringify(text)})`));
@@ -2017,6 +2042,103 @@ test('OCR-01 spóźnione dekodowanie zdjęcia nie zasłania nowo otwartego dokum
     assert.equal(h.run('currentDocument.name'),'nowszy.txt');
     assert.equal(h.context.document.getElementById('ocrPreview').hidden,true);
     assert.equal(h.context.document.getElementById('ocrRun').disabled,true);
+});
+test('OCR-01B długi screenshot trafia do OCR jako rzeczywiście przycięty canvas', async () => {
+    const cropDraws=[], seen=[];
+    let h;
+    const tesseract={async createWorker(){return {recognize:async image=>{
+        seen.push({width:image.width,height:image.height,same:image===h.context.document.getElementById('ocrPreview')});
+        return {data:{text:'Tekst po OCR.'}};
+    },terminate:async()=>{}};}};
+    h=harness(async()=>ok(),' ',true,null,null,{tesseract,cropDraws,
+        createImageBitmap:async(_file,options)=>{
+            assert.equal(options.imageOrientation,'from-image');
+            return {width:1000,height:2000,close(){}};
+        }});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const photo=new Blob(['screen'],{type:'image/png'});
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[photo],value:'screen'}});
+    const canvas=h.context.document.getElementById('ocrPreview');
+    assert.equal(canvas.width,1000); assert.equal(canvas.height,2000);
+    assert.equal(h.context.document.getElementById('ocrCropStage').hidden,false);
+    await h.run('window.runOcr()');
+    assert.deepEqual(seen[0],{width:1000,height:2000,same:true},'Całe zdjęcie keeps existing OCR path');
+    const selection=h.context.document.getElementById('ocrCropSelection');
+    function drag(handle,startY,endY,id) {
+        selection.dispatch('pointerdown',{target:{dataset:{cropHandle:handle}},pointerId:id,clientX:180,clientY:startY,preventDefault(){}});
+        selection.dispatch('pointermove',{pointerId:id,clientX:180,clientY:endY,preventDefault(){}});
+        selection.dispatch('pointerup',{pointerId:id});
+    }
+    drag('n',0,72,1);
+    drag('s',720,648,2);
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,true,'changed crop requires Apply');
+    assert.equal(h.context.document.getElementById('ocrApply').hidden,true,'old result cannot be approved');
+    assert.equal(h.context.document.getElementById('ocrText').value,'');
+    h.run('window.applyOcrCrop()');
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,false);
+    await h.run('window.runOcr()');
+    assert.deepEqual(seen[1],{width:1000,height:1600,same:false});
+    assert.deepEqual(cropDraws[0].slice(1),[0,200,1000,1600,0,0,1000,1600]);
+    h.run('window.resetOcrCrop()');
+    assert.equal(h.context.document.getElementById('ocrApply').hidden,true);
+    await h.run('window.runOcr()');
+    assert.deepEqual(seen[2],{width:1000,height:2000,same:true},'Całe zdjęcie resets real OCR input');
+});
+test('OCR-01B zmiana kadru podczas OCR anuluje stary wynik i nie pozwala go zatwierdzić', async () => {
+    let resolveRecognition, terminated=0;
+    const tesseract={async createWorker(){return {recognize:()=>new Promise(resolve=>{resolveRecognition=resolve;}),
+        terminate:async()=>{terminated++;}};}};
+    const h=harness(async()=>ok(),' ',true,null,null,{tesseract});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const photo=new Blob(['photo'],{type:'image/png'});
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[photo],value:'photo'}});
+    const running=h.run('window.runOcr()');
+    for(let i=0;i<12 && !resolveRecognition;i++)await Promise.resolve();
+    assert.ok(resolveRecognition);
+    const selection=h.context.document.getElementById('ocrCropSelection');
+    selection.dispatch('pointerdown',{target:{dataset:{cropHandle:'n'}},pointerId:9,clientX:180,clientY:0,preventDefault(){}});
+    selection.dispatch('pointermove',{pointerId:9,clientX:180,clientY:36,preventDefault(){}});
+    selection.dispatch('pointerup',{pointerId:9});
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,true);
+    resolveRecognition({data:{text:'Nieaktualny wynik.'}});
+    await running;
+    assert.equal(terminated,1);
+    assert.equal(h.context.document.getElementById('ocrText').hidden,true);
+    assert.equal(h.context.document.getElementById('ocrText').value,'');
+    h.run('window.applyOcrText()');
+    assert.equal(h.run('currentDocument'),null);
+    h.run('window.applyOcrCrop()');
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,false);
+});
+test('OCR-01B rozwiń i zwiń edytor zachowuje korekty oraz reaguje na klawiaturę', async () => {
+    const visualViewport={height:700,offsetTop:0,listeners:{},addEventListener(type,fn){this.listeners[type]=fn;}};
+    const idb=memoryIndexedDB();
+    const tesseract={async createWorker(){return {recognize:async()=>({data:{text:'Pierwsze zdanie. Drugie zdanie.'}}),terminate:async()=>{}};}};
+    const h=harness(async()=>ok(),' ',true,null,idb,{tesseract,visualViewport});
+    await settle();
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const photo=new Blob(['photo'],{type:'image/jpeg'});
+    await h.context.document.getElementById('ocrCameraInput').listeners.change({target:{files:[photo],value:'photo'}});
+    await h.run('window.runOcr()');
+    const dialog=h.context.document.getElementById('addContentDialog');
+    const editor=h.context.document.getElementById('ocrText');
+    assert.equal(h.context.document.getElementById('ocrExpand').hidden,false);
+    h.run('window.toggleOcrEditor()');
+    assert.equal(dialog.classList.contains('ocr-editor-expanded'),true);
+    assert.equal(dialog.style['--ocr-viewport-height'],'700px');
+    editor.value='Poprawione zdanie. Jeszcze jedno.';
+    visualViewport.height=350; visualViewport.offsetTop=40;
+    visualViewport.listeners.resize();
+    assert.equal(dialog.style['--ocr-viewport-height'],'350px');
+    assert.equal(dialog.style['--ocr-viewport-top'],'40px');
+    h.run('window.toggleOcrEditor()');
+    assert.equal(dialog.classList.contains('ocr-editor-expanded'),false);
+    assert.equal(editor.value,'Poprawione zdanie. Jeszcze jedno.','closing expanded view retains edits');
+    h.run('window.toggleOcrEditor(); window.applyOcrText()');
+    await settle();
+    assert.equal(h.run('currentDocument.text'),'Poprawione zdanie. Jeszcze jedno.');
+    assert.equal(latestDocument(idb).text,'Poprawione zdanie. Jeszcze jedno.');
+    assert.equal(dialog.classList.contains('ocr-editor-expanded'),false);
 });
 (async () => {
     for (const [name, fn] of cases) {
