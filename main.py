@@ -64,11 +64,13 @@ HTML_PAGE = """
         :root {
             --bg: #121316; --surface: #1e2025; --surface-light: #2a2d35;
             --primary: #3b82f6; --text: #f3f4f6; --text-muted: #9ca3af;
+            --ocr-ready: #a6edc0; --ocr-action: #1d4ed8;
             --highlight-bg: #78350f; --highlight-border: #f59e0b;
         }
         body.light {
             --bg: #f3f4f6; --surface: #ffffff; --surface-light: #e5e7eb;
             --primary: #2563eb; --text: #111827; --text-muted: #6b7280;
+            --ocr-ready: #166534; --ocr-action: #1d4ed8;
             --highlight-bg: #fef3c7; --highlight-border: #f59e0b;
         }
         * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -205,14 +207,16 @@ HTML_PAGE = """
         .text-import-form[hidden] { display: none; }
         .text-import-form { display: flex; min-height: min(45dvh, 340px); flex-direction: column; gap: 10px; }
         .text-import-form textarea { min-height: 150px; }
-        .ocr-import[hidden], .ocr-import textarea[hidden], .ocr-import canvas[hidden], .ocr-import progress[hidden], .ocr-crop-stage[hidden], .ocr-crop-actions[hidden], .ocr-crop-hint[hidden], .ocr-import button[hidden], .ocr-import label[hidden] { display: none; }
+        .ocr-import[hidden], .ocr-import textarea[hidden], .ocr-import canvas[hidden], .ocr-import progress[hidden], .ocr-crop-stage[hidden], .ocr-crop-actions[hidden], .ocr-crop-hint[hidden], .ocr-crop-selection[hidden], .ocr-import button[hidden], .ocr-import label[hidden] { display: none; }
         .ocr-import { display: flex; flex-direction: column; gap: 10px; }
         .ocr-choices { display: flex; flex-wrap: wrap; gap: 8px; }
         .ocr-choices button, .ocr-actions button, .ocr-crop-actions button, #ocrExpand { min-height: 44px; border: 0; border-radius: 12px; padding: 9px 12px; color: var(--text); background: var(--surface-light); font: inherit; font-weight: 600; }
         .ocr-choices button { flex: 1 1 145px; }
         .ocr-crop-stage { width: 100%; max-height: min(48dvh, 500px); overflow: auto; overscroll-behavior: contain; padding: 6px 14px 6px 6px; border-radius: 10px; background: var(--bg); }
         .ocr-crop-surface { position: relative; width: 100%; overflow: hidden; }
+        .ocr-crop-surface.is-applied { overflow: visible; }
         .ocr-crop-surface canvas { display: block; width: 100%; height: auto; background: white; }
+        .ocr-crop-surface #ocrAppliedPreview { width: max(100%, var(--ocr-applied-min-width, 0px)); max-width: none; }
         .ocr-crop-selection { position: absolute; border: 2px solid var(--highlight-border); box-shadow: 0 0 0 3000px rgba(0,0,0,.38); pointer-events: none; }
         .ocr-crop-selection button { position: absolute; z-index: 1; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: transparent; pointer-events: auto; touch-action: none; }
         .ocr-crop-selection button::after { content: ''; display: block; width: 14px; height: 14px; margin: auto; border-radius: 50%; border: 2px solid white; background: var(--highlight-border); box-shadow: 0 1px 5px #000; }
@@ -229,6 +233,10 @@ HTML_PAGE = """
         .ocr-crop-actions { display: flex; gap: 8px; flex-wrap: wrap; }
         .ocr-crop-actions button { flex: 1 1 145px; }
         .ocr-crop-hint { color: var(--text-muted); font-size: .76rem; line-height: 1.4; }
+        #ocrCropTitle { color: var(--text); font-size: .95rem; }
+        #ocrCropTitle.is-applied { color: var(--ocr-ready); }
+        #ocrStatus { color: var(--text); }
+        #ocrRun:not(:disabled) { color: white; background: var(--ocr-action); }
         .ocr-import progress { width: 100%; accent-color: var(--primary); }
         .ocr-import textarea { flex: none; min-height: 170px; resize: vertical; }
         #ocrExpand { width: 100%; }
@@ -354,6 +362,7 @@ HTML_PAGE = """
                 <div class="ocr-crop-stage" id="ocrCropStage" hidden>
                     <div class="ocr-crop-surface" id="ocrCropSurface">
                         <canvas id="ocrPreview" aria-label="Podgląd wybranego zdjęcia" hidden></canvas>
+                        <canvas id="ocrAppliedPreview" aria-label="Podgląd zastosowanego kadru" hidden></canvas>
                         <div class="ocr-crop-selection" id="ocrCropSelection" aria-label="Zaznaczony kadr">
                             <button type="button" data-crop-handle="nw" aria-label="Zmień lewy górny róg kadru"></button>
                             <button type="button" data-crop-handle="n" aria-label="Zmień górną krawędź kadru"></button>
@@ -367,7 +376,7 @@ HTML_PAGE = """
                         </div>
                     </div>
                 </div>
-                <div class="ocr-crop-actions" id="ocrCropActions" hidden><button type="button" id="ocrApplyCrop" onclick="window.applyOcrCrop()" disabled>Zastosuj kadr</button><button type="button" id="ocrResetCrop" onclick="window.resetOcrCrop()" disabled>Całe zdjęcie</button></div>
+                <div class="ocr-crop-actions" id="ocrCropActions" hidden><button type="button" id="ocrApplyCrop" onclick="window.applyOcrCrop()" disabled>Zastosuj kadr</button><button type="button" id="ocrChangeCrop" onclick="window.changeOcrCrop()" hidden>Zmień kadr</button><button type="button" id="ocrResetCrop" onclick="window.resetOcrCrop()" disabled>Całe zdjęcie</button></div>
                 <small class="ocr-crop-hint" id="ocrCropHint" hidden>Przesuń kadr środkowym uchwytem albo zmień jego krawędzie. Długi obraz przewijaj poza uchwytami. Wybierz „Całe zdjęcie”, aby pominąć kadrowanie.</small>
                 <div class="import-status" id="ocrStatus" role="status" aria-live="polite">Wybierz jedno zdjęcie. Rozpoznawanie odbywa się na telefonie.</div>
                 <progress id="ocrProgress" max="100" value="0" aria-label="Postęp rozpoznawania" hidden></progress>

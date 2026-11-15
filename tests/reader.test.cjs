@@ -170,7 +170,9 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
     let now = 0;
     const delays = [];
     class Clock extends Date { static now() { return now; } }
-    const window = {addEventListener(type, callback) { windowListeners[type] = callback; }, ...(ocrOptions.visualViewport ? {visualViewport:ocrOptions.visualViewport} : {}),
+    const window = {addEventListener(type, callback) { windowListeners[type] = callback; },
+        confirm: message => ocrOptions.confirm ? ocrOptions.confirm(message) : true,
+        ...(ocrOptions.visualViewport ? {visualViewport:ocrOptions.visualViewport} : {}),
         ...(indexedDBApi ? {indexedDB: indexedDBApi} : {}),
         ...(ocrOptions.tesseract ? {Tesseract: ocrOptions.tesseract} : {})};
     const context = vm.createContext({window, location: {search: query, origin: 'https://example.test'}, URLSearchParams, Blob, Event,
@@ -185,6 +187,7 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
                     value.getContext=()=>({fillRect() {},drawImage() {}});
                     value.getBoundingClientRect=()=>({left:0,top:0,width:360,height:360*value.height/value.width});
                 }
+                if (id==='ocrAppliedPreview') value.getContext=()=>({drawImage(...args){ocrOptions.cropDraws?.push(args);}});
                 elements.set(id,value);
             }
             return elements.get(id);
@@ -2083,6 +2086,113 @@ test('OCR-01B długi screenshot trafia do OCR jako rzeczywiście przycięty canv
     assert.equal(h.context.document.getElementById('ocrApply').hidden,true);
     await h.run('window.runOcr()');
     assert.deepEqual(seen[2],{width:1000,height:2000,same:true},'Całe zdjęcie resets real OCR input');
+});
+test('OCR-01C zastosowany kadr pokazuje wybrane piksele i prowadzi do właściwego OCR', async () => {
+    const draws=[], seen=[];
+    const h=harness(async()=>ok(),' ',true,null,null,{cropDraws:draws,
+        createImageBitmap:async()=>({width:1000,height:2000,close(){}}),
+        tesseract:{async createWorker(){return {recognize:async image=>{
+            seen.push(image);
+            return {data:{text:'Tekst z kadru.'}};
+        },terminate:async()=>{}};}}});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[new Blob(['screen'],{type:'image/png'})],value:'screen'}});
+    const get=id=>h.context.document.getElementById(id);
+    assert.equal(get('ocrRun').textContent,'Rozpoznaj tekst');
+    const selection=get('ocrCropSelection');
+    selection.dispatch('pointerdown',{target:{dataset:{cropHandle:'n'}},pointerId:1,clientX:180,clientY:0,preventDefault(){}});
+    selection.dispatch('pointermove',{pointerId:1,clientX:180,clientY:36,preventDefault(){}});
+    selection.dispatch('pointerup',{pointerId:1});
+    assert.equal(get('ocrRun').disabled,true);
+    h.run('window.applyOcrCrop()');
+    assert.equal(get('ocrPreview').hidden,true);
+    assert.equal(selection.hidden,true);
+    assert.equal(get('ocrAppliedPreview').hidden,false);
+    assert.equal(get('ocrCropSurface').classList.contains('is-applied'),true);
+    assert.equal(get('ocrAppliedPreview').width,1000);
+    assert.equal(get('ocrAppliedPreview').height,1900);
+    assert.deepEqual(draws[0].slice(1),[0,100,1000,1900,0,0,1000,1900]);
+    assert.equal(get('ocrCropTitle').textContent,'Kadr gotowy ✓');
+    assert.match(get('ocrStatus').textContent,/Kadr gotowy/);
+    assert.equal(get('ocrApplyCrop').hidden,true);
+    assert.equal(get('ocrChangeCrop').hidden,false);
+    assert.equal(get('ocrRun').textContent,'Rozpoznaj zaznaczony tekst');
+    assert.equal(get('ocrRun').disabled,false);
+    await h.run('window.runOcr()');
+    assert.equal(seen[0],get('ocrAppliedPreview'));
+    assert.equal(get('ocrText').value,'Tekst z kadru.');
+    h.run('window.changeOcrCrop()');
+    assert.equal(get('ocrPreview').hidden,false);
+    assert.equal(selection.hidden,false);
+    assert.equal(get('ocrAppliedPreview').hidden,true);
+    assert.equal(get('ocrCropSurface').classList.contains('is-applied'),false);
+    assert.equal(get('ocrRun').disabled,true);
+    assert.equal(get('ocrText').value,'Tekst z kadru.','powrót bez zmiany ramki zachowuje wynik');
+    selection.dispatch('pointerdown',{target:{dataset:{cropHandle:'s'}},pointerId:2,clientX:180,clientY:720,preventDefault(){}});
+    selection.dispatch('pointermove',{pointerId:2,clientX:180,clientY:684,preventDefault(){}});
+    selection.dispatch('pointerup',{pointerId:2});
+    assert.equal(get('ocrText').value,'');
+    assert.equal(get('ocrApply').hidden,true);
+    h.run('window.applyOcrCrop()');
+    assert.equal(get('ocrAppliedPreview').height,1800);
+    h.run('window.resetOcrCrop()');
+    assert.equal(get('ocrAppliedPreview').width,0);
+    assert.equal(get('ocrPreview').hidden,false);
+    assert.equal(get('ocrRun').textContent,'Rozpoznaj tekst');
+    await h.run('window.runOcr()');
+    assert.equal(seen[1],get('ocrPreview'));
+});
+test('OCR-01C niski wycinek pozostaje czytelny i poprawki wymagają świadomego resetu', async () => {
+    let allow=false, prompts=0;
+    const h=harness(async()=>ok(),' ',true,null,null,{confirm:()=>{prompts++;return allow;},
+        createImageBitmap:async()=>({width:1000,height:2000,close(){}}),
+        tesseract:{async createWorker(){return {recognize:async()=>({data:{text:'Tekst pierwotny.'}}),terminate:async()=>{}};}}});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[new Blob(['screen'],{type:'image/png'})],value:'screen'}});
+    const get=id=>h.context.document.getElementById(id);
+    const selection=get('ocrCropSelection');
+    selection.dispatch('pointerdown',{target:{dataset:{cropHandle:'s'}},pointerId:1,clientX:180,clientY:720,preventDefault(){}});
+    selection.dispatch('pointermove',{pointerId:1,clientX:180,clientY:36,preventDefault(){}});
+    selection.dispatch('pointerup',{pointerId:1});
+    h.run('window.applyOcrCrop()');
+    const strip=get('ocrAppliedPreview');
+    assert.ok(strip.height>=100 && strip.height<=101);
+    assert.equal(strip.style['--ocr-applied-min-width'],`${Math.ceil(120*strip.width/strip.height)}px`);
+    await h.run('window.runOcr()');
+    get('ocrText').value='Moja poprawka.';
+    h.run('window.changeOcrCrop()');
+    assert.equal(prompts,0,'sam powrót do edycji nie usuwa poprawek');
+    selection.dispatch('pointerdown',{target:{dataset:{cropHandle:'n'}},pointerId:2,clientX:180,clientY:0,preventDefault(){}});
+    selection.dispatch('pointermove',{pointerId:2,clientX:180,clientY:18,preventDefault(){}});
+    assert.equal(prompts,1);
+    assert.equal(get('ocrText').value,'Moja poprawka.');
+    assert.equal(get('ocrApply').hidden,false);
+    h.run('window.resetOcrCrop()');
+    assert.equal(prompts,2);
+    assert.equal(get('ocrText').value,'Moja poprawka.');
+    allow=true;
+    h.run('window.resetOcrCrop()');
+    assert.equal(get('ocrText').value,'');
+    assert.equal(get('ocrApply').hidden,true);
+    assert.equal(get('ocrRun').textContent,'Rozpoznaj tekst');
+});
+test('OCR-01C anulowany wynik nie wraca do podglądu zastosowanego kadru', async () => {
+    let resolveRecognition;
+    const h=harness(async()=>ok(),' ',true,null,null,{tesseract:{async createWorker(){return {
+        recognize:()=>new Promise(resolve=>{resolveRecognition=resolve;}),terminate:async()=>{}};}}});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[new Blob(['photo'],{type:'image/png'})],value:'photo'}});
+    h.run('window.applyOcrCrop()');
+    const running=h.run('window.runOcr()');
+    for(let i=0;i<12 && !resolveRecognition;i++)await Promise.resolve();
+    assert.ok(resolveRecognition);
+    h.run('window.cancelOcrRecognition()');
+    resolveRecognition({data:{text:'Spóźniony wynik.'}});
+    await running;
+    assert.equal(h.context.document.getElementById('ocrText').value,'');
+    assert.equal(h.context.document.getElementById('ocrApply').hidden,true);
+    assert.equal(h.context.document.getElementById('ocrAppliedPreview').hidden,false);
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,false);
 });
 test('OCR-01B zmiana kadru podczas OCR anuluje stary wynik i nie pozwala go zatwierdzić', async () => {
     let resolveRecognition, terminated=0;
