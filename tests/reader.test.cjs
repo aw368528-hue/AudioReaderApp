@@ -5,7 +5,59 @@ const script = fs.readFileSync(0, 'utf8');
 async function settle() { for (let n = 0; n < 12; n++) await new Promise(r => setTimeout(r, 1)); }
 const ok = () => ({ok: true, blob: async () => ({size: 10, arrayBuffer: async () => new ArrayBuffer(10)})});
 const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
-function harness(fetch, query = '', withMediaSession = true, mseSupport = null) {
+function memoryIndexedDB() {
+    const data = new Map();
+    const control = {data, failWrites: 0, holdNextReadwriteGet: false, releaseHeldRead: null};
+    const db = {
+        objectStoreNames: {contains: name => name === 'documents'},
+        createObjectStore() {},
+        transaction(name, mode) {
+            assert.equal(name, 'documents');
+            const tx = {error: null};
+            let pending = 0;
+            const completeWhenIdle = () => {
+                if (!pending) setTimeout(() => { if (!pending) tx.oncomplete?.(); }, 0);
+            };
+            const schedule = callback => {
+                pending++;
+                setTimeout(() => { callback(); pending--; completeWhenIdle(); }, 0);
+            };
+            tx.objectStore = () => ({
+                get(key) {
+                    const request = {};
+                    const run = () => schedule(() => { request.result = data.get(key) || null; request.onsuccess?.(); });
+                    if (mode === 'readwrite' && control.holdNextReadwriteGet) {
+                        control.holdNextReadwriteGet = false;
+                        control.releaseHeldRead = run;
+                    } else run();
+                    return request;
+                },
+                put(record) {
+                    schedule(() => {
+                        if (control.failWrites) {
+                            control.failWrites--;
+                            tx.error = Object.assign(new Error('quota exceeded'), {name: 'QuotaExceededError'});
+                            tx.onerror?.(); tx.onabort?.();
+                        } else data.set(record.id, JSON.parse(JSON.stringify(record)));
+                    });
+                },
+                delete(key) { schedule(() => { data.delete(key); }); }
+            });
+            return tx;
+        }
+    };
+    let upgraded = false;
+    return Object.assign(control, {open() {
+        const request = {};
+        setTimeout(() => {
+            request.result = db;
+            if (!upgraded) { upgraded = true; request.onupgradeneeded?.(); }
+            request.onsuccess?.();
+        }, 0);
+        return request;
+    }});
+}
+function harness(fetch, query = '', withMediaSession = true, mseSupport = null, indexedDBApi = null) {
     const elements = new Map();
     function element() {
         return {value: '', style: {}, innerText: '', innerHTML: '', children: [],
@@ -17,6 +69,7 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null) 
     const created = [];
     const body = element();
     const documentListeners = {};
+    const windowListeners = {};
     const mediaActions = {};
     const mediaSession = {playbackState: 'none', metadata: null,
         setActionHandler(action, callback) { mediaActions[action] = callback; }};
@@ -69,7 +122,8 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null) 
     let now = 0;
     const delays = [];
     class Clock extends Date { static now() { return now; } }
-    const context = vm.createContext({window: {}, location: {search: query}, URLSearchParams, Blob, Event,
+    const window = {addEventListener(type, callback) { windowListeners[type] = callback; }, ...(indexedDBApi ? {indexedDB: indexedDBApi} : {})};
+    const context = vm.createContext({window, location: {search: query}, URLSearchParams, Blob, Event,
         navigator: {clipboard: {writeText: async text => { context.copied = text; }}, ...(withMediaSession ? {mediaSession} : {})},
         MediaMetadata: class MediaMetadata { constructor(data) { Object.assign(this, data); } },
         performance: {now: () => performanceTime}, document: {body, visibilityState: 'visible',
@@ -85,7 +139,7 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null) 
     const run = code => vm.runInContext(code, context);
     context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
     context.document.getElementById('rateSlider').value = '0';
-    return {run, context, elements, audios, delays, revoked, created, documentListeners, mediaSession, mediaActions, mediaSources, sourceBuffers,
+    return {run, context, elements, audios, delays, revoked, created, documentListeners, windowListeners, mediaSession, mediaActions, mediaSources, sourceBuffers, indexedDBApi,
         advance(ms) { performanceTime += ms; }};
 }
 const cases = [];
@@ -1183,6 +1237,169 @@ test('Usunięcie udanego audio nie daje nieskończonych prób po nowym błędzie
     await assert.rejects(h.run('fetchAudioBlob(0)'),/Wyczerpano 3 próby/);
     assert.equal(calls,4);
     assert.equal(h.run('session'),token);
+});
+test('UX-01 wklejony tekst i miejsce wracają lokalnie bez automatycznego odtwarzania', async () => {
+    const idb = memoryIndexedDB();
+    const h = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    h.context.document.getElementById('voiceSelect').value = 'pl-PL-MarekNeural';
+    h.context.document.getElementById('rateSlider').value = '20';
+    h.context.document.getElementById('rawText').value = 'Pierwsze zdanie. Drugie zdanie.';
+    h.run('window.applyText()'); await settle();
+    assert.equal(idb.data.get('last').name, 'Wklejony tekst');
+    assert.equal(idb.data.get('last').text, 'Pierwsze zdanie. Drugie zdanie.');
+    h.run('window.startFrom(1)'); await settle();
+    h.run('window.togglePlay()'); await settle();
+    assert.equal(idb.data.get('last').index, 1);
+    assert.equal(idb.data.get('last').voice, 'pl-PL-MarekNeural');
+    assert.equal(idb.data.get('last').rate, '20');
+
+    let reopenedFetches = 0;
+    const reopened = harness(async()=>{reopenedFetches++; return ok();}, '', true, null, idb);
+    await settle();
+    assert.deepEqual(Array.from(reopened.run('sentences')), ['Pierwsze zdanie.', 'Drugie zdanie.']);
+    assert.equal(reopened.run('currentIdx'), 1);
+    assert.equal(reopened.run('isReading'), false, 'reload must never start playback automatically');
+    assert.equal(reopened.audios.at(-1).plays, 0);
+    assert.equal(reopened.context.document.getElementById('voiceSelect').value, 'pl-PL-MarekNeural');
+    assert.equal(reopened.context.document.getElementById('rateSlider').value, '20');
+    assert.equal(reopened.context.document.getElementById('resumeContinue').hidden, false);
+    assert.equal(reopenedFetches, 0, 'restoring a document does not send it to the backend or generate TTS');
+    assert.match(reopened.context.document.getElementById('resumeNote').textContent, /lokalnie w tej przeglądarce/);
+    reopened.run('window.continueSavedDocument()'); await settle();
+    assert.equal(reopened.run('isReading'), true);
+    assert.equal(reopened.run('currentIdx'), 1);
+    assert.equal(reopened.audios.at(-1).plays, 1);
+});
+test('UX-01 import zapisuje nazwę i bloki; nieudany następny import zachowuje poprzedni dokument', async () => {
+    const idb = memoryIndexedDB();
+    idb.data.set('last', {id:'last', version:1, segmentationVersion:1, text:'Stary zapis.', name:'stary.txt',
+        blocks:[], sentenceCount:1, index:0, completed:false, voice:'pl-PL-ZofiaNeural', rate:'0'});
+    let imports = 0;
+    const h = harness(async url => {
+        if (url !== '/upload') return ok();
+        imports++;
+        if (imports === 1) return {ok:true, json:async()=>({text:'Nagłówek.\nTreść dokumentu.', blocks:[{start:0,end:10,kind:'heading'}]})};
+        return {ok:false, status:500};
+    }, '', true, null, idb);
+    await settle();
+    assert.equal(h.run('currentDocument.name'), 'stary.txt');
+    const firstFile = new Blob(['pdf']); firstFile.name = 'raport.pdf';
+    h.context.document.getElementById('fileInput').listeners.change({target:{files:[firstFile]}});
+    await settle();
+    const saved = JSON.parse(JSON.stringify(idb.data.get('last')));
+    assert.equal(saved.name, 'raport.pdf');
+    assert.notEqual(saved.text, 'Stary zapis.', 'a successful new import replaces the prior remembered document');
+    assert.deepEqual(saved.blocks, [{start:0,end:10,kind:'heading'}]);
+    assert.equal(saved.text, 'Nagłówek.\nTreść dokumentu.');
+    const secondFile = new Blob(['bad']); secondFile.name = 'bad.pdf';
+    h.context.document.getElementById('fileInput').listeners.change({target:{files:[secondFile]}});
+    await settle();
+    assert.deepEqual(idb.data.get('last'), saved, 'failed import leaves the known-good local document untouched');
+    assert.equal(imports, 2, 'local save/restore causes no extra upload request');
+});
+test('UX-01 spóźniony zapis poprzedniego dokumentu nie nadpisuje aktualnego', async () => {
+    const idb = memoryIndexedDB();
+    const h = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    h.context.document.getElementById('rawText').value = 'Dokument poprzedni.';
+    h.run('window.applyText()');
+    h.context.document.getElementById('rawText').value = 'Dokument aktualny.';
+    h.run('window.applyText()');
+    await settle();
+    assert.equal(idb.data.get('last').text, 'Dokument aktualny.');
+    assert.equal(idb.data.get('last').name, 'Wklejony tekst');
+});
+test('UX-01 przejście zdania w MSE zapisuje indeks bez zmiany streamu', async () => {
+    const idb = memoryIndexedDB();
+    const h = harness(async()=>ok(), '?buffer=2', true, true, idb);
+    await settle();
+    h.run('renderSentences("Pierwsze. Drugie.", [], {name:"test.txt"}); window.startFrom(0)'); await settle();
+    const player = h.audios.at(-1);
+    const source = player.src;
+    h.run('audio.currentTime=10; audio.ontimeupdate()'); await settle();
+    assert.equal(h.run('currentIdx'), 1);
+    assert.equal(idb.data.get('last').index, 1);
+    assert.equal(player.src, source);
+    assert.equal(player.plays, 1, 'saving resume position does not restart the MSE stream');
+    h.run('window.stopReading()');
+});
+test('UX-01 końcówka dokumentu zapisuje ukończenie i pozwala zacząć od początku', async () => {
+    const idb = memoryIndexedDB();
+    const h = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    h.context.document.getElementById('rawText').value = 'Jedno zdanie.';
+    h.run('window.applyText()'); await settle();
+    h.run('window.startFrom(0)'); await settle();
+    h.run('audio.onended()'); await settle();
+    assert.equal(idb.data.get('last').completed, true);
+    assert.equal(idb.data.get('last').index, 1);
+    const reopened = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    assert.equal(reopened.run('isReading'), false);
+    assert.equal(reopened.run('currentIdx'), 1);
+    assert.equal(reopened.context.document.getElementById('resumeContinue').textContent, 'Czytaj od początku');
+    reopened.run('window.continueSavedDocument()'); await settle();
+    assert.equal(reopened.run('currentIdx'), 0);
+    assert.equal(reopened.run('isReading'), true);
+});
+test('UX-01 stary lub uszkodzony zapis jest odrzucany do pustego stanu', async () => {
+    const idb = memoryIndexedDB();
+    idb.data.set('last', {id:'last', version:1, segmentationVersion:99, text:'Nieaktualny zapis.', name:'old.txt',
+        blocks:[], sentenceCount:1, index:0, completed:false, voice:'pl-PL-ZofiaNeural', rate:'0'});
+    const h = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    assert.deepEqual(Array.from(h.run('sentences')), []);
+    assert.equal(h.run('isReading'), false);
+    assert.equal(h.audios.at(-1).plays, 0);
+    assert.equal(idb.data.has('last'), false);
+});
+test('UX-01 opóźnione czyszczenie starego rekordu nie usuwa nowego dokumentu', async () => {
+    const idb = memoryIndexedDB();
+    idb.data.set('last', {id:'last', version:1, segmentationVersion:99, text:'Stary niezgodny tekst.', name:'old.txt',
+        blocks:[], sentenceCount:1, index:0, completed:false, voice:'pl-PL-ZofiaNeural', rate:'0', savedAt:100});
+    idb.holdNextReadwriteGet = true;
+    const h = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    assert.equal(typeof idb.releaseHeldRead, 'function', 'invalid-record cleanup is paused in its readwrite transaction');
+
+    h.run('renderSentences("Nowy dokument.", [], {name:"nowy.txt"})');
+    idb.releaseHeldRead();
+    await settle();
+    assert.equal(idb.data.get('last').text, 'Nowy dokument.');
+    assert.equal(idb.data.get('last').name, 'nowy.txt');
+    assert.equal(idb.data.get('last').segmentationVersion, 1);
+});
+test('UX-01 usuń czyści dokument i nie zapisuje go ponownie podczas stopu', async () => {
+    const idb = memoryIndexedDB();
+    const h = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    h.context.document.getElementById('rawText').value = 'Do usunięcia.';
+    h.run('window.applyText()'); await settle();
+    assert.equal(idb.data.has('last'), true);
+    h.run('window.deleteSavedDocument()'); await settle();
+    assert.equal(idb.data.has('last'), false);
+    h.run('window.startFrom(0)'); await settle();
+    h.run('window.stopReading()'); await settle();
+    assert.equal(idb.data.has('last'), false, 'deleted content and position stay deleted for the current document');
+});
+test('UX-01 brak IndexedDB lub quota nie blokuje odtwarzania', async () => {
+    const noStorage = harness(async()=>ok());
+    noStorage.context.document.getElementById('rawText').value = 'Odtwarzanie bez zapisu.';
+    noStorage.run('window.applyText()'); await settle();
+    noStorage.run('window.startFrom(0)'); await settle();
+    assert.equal(noStorage.run('isReading'), true);
+    assert.equal(noStorage.audios.at(-1).plays, 1);
+
+    const idb = memoryIndexedDB(); idb.failWrites = 1;
+    const quota = harness(async()=>ok(), '', true, null, idb);
+    await settle();
+    quota.context.document.getElementById('rawText').value = 'Odtwarzanie przy pełnej pamięci.';
+    quota.run('window.applyText()'); await settle();
+    assert.match(quota.context.document.getElementById('resumeTitle').textContent, /nie został zapisany/);
+    quota.run('window.startFrom(0)'); await settle();
+    assert.equal(quota.run('isReading'), true);
+    assert.equal(quota.audios.at(-1).plays, 1);
 });
 (async () => {
     for (const [name, fn] of cases) {
