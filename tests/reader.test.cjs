@@ -2,6 +2,7 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const script = fs.readFileSync(0, 'utf8');
+const ocrModule = fs.readFileSync('ocr_prototype/app-ocr.js', 'utf8');
 async function settle() { for (let n = 0; n < 12; n++) await new Promise(r => setTimeout(r, 1)); }
 const ok = () => ({ok: true, blob: async () => ({size: 10, arrayBuffer: async () => new ArrayBuffer(10)})});
 const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
@@ -96,7 +97,7 @@ function memoryIndexedDB() {
         return request;
     }});
 }
-function harness(fetch, query = '', withMediaSession = true, mseSupport = null, indexedDBApi = null) {
+function harness(fetch, query = '', withMediaSession = true, mseSupport = null, indexedDBApi = null, ocrOptions = {}) {
     const elements = new Map();
     function element() {
         const classes = new Set();
@@ -166,19 +167,37 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
     let now = 0;
     const delays = [];
     class Clock extends Date { static now() { return now; } }
-    const window = {addEventListener(type, callback) { windowListeners[type] = callback; }, ...(indexedDBApi ? {indexedDB: indexedDBApi} : {})};
-    const context = vm.createContext({window, location: {search: query}, URLSearchParams, Blob, Event,
+    const window = {addEventListener(type, callback) { windowListeners[type] = callback; }, ...(indexedDBApi ? {indexedDB: indexedDBApi} : {}),
+        ...(ocrOptions.tesseract ? {Tesseract: ocrOptions.tesseract} : {})};
+    const context = vm.createContext({window, location: {search: query, origin: 'https://example.test'}, URLSearchParams, Blob, Event,
         navigator: {clipboard: {writeText: async text => { context.copied = text; }}, ...(withMediaSession ? {mediaSession} : {})},
         MediaMetadata: class MediaMetadata { constructor(data) { Object.assign(this, data); } },
         performance: {now: () => performanceTime}, document: {body, visibilityState: 'visible',
         addEventListener(type, callback) { documentListeners[type] = callback; }, activeElement: null,
-        getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
+        getElementById(id) {
+            if (!elements.has(id)) {
+                const value=element();
+                if (id==='ocrPreview') value.getContext=()=>({fillRect() {},drawImage() {}});
+                elements.set(id,value);
+            }
+            return elements.get(id);
+        },
+        head: {appendChild(script) { ocrOptions.onScript?.(script, window); }},
         createElement: element, querySelectorAll: () => []}, Audio, ...(mseSupport === null ? {} : {MediaSource}), fetch, FormData, AbortController,
+        createImageBitmap: ocrOptions.createImageBitmap || (async () => ({width:1200,height:800,close() {}})),
         DOMException, TypeError, URL: {createObjectURL: blob => {
             if (blob instanceof MediaSource) { const url=`mse:${mediaSources.length}`; blob.url=url; return url; }
             const url = `blob:${created.length}`; created.push({url, blob}); return url;
         }, revokeObjectURL: url => revoked.push(url)},
-        Date: Clock, setTimeout: (fn, ms) => { delays.push(ms); return setTimeout(() => { now += ms; fn(); }, 0); }, clearTimeout, alert() {}});
+        Date: Clock, setTimeout: (fn, ms) => {
+            delays.push(ms);
+            if ((ocrOptions.tesseract || ocrOptions.onScript) && ms===90000) return setTimeout(fn,ms);
+            return setTimeout(() => { now += ms; fn(); }, 0);
+        }, clearTimeout, alert() {}});
+    if (!ocrOptions.skipModule) {
+        vm.runInContext(ocrModule, context);
+        window.createOcrImport = context.createOcrImport;
+    }
     vm.runInContext(script, context);
     const run = code => vm.runInContext(code, context);
     context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
@@ -1774,6 +1793,230 @@ test('UI-01 ustawienia są opcjonalnym panelem z kontrolą stanu dostępności',
     h.run('window.toggleSettings(false)');
     assert.equal(panel.hidden,true);
     assert.equal(h.context.document.getElementById('miniPlayer').hidden,true,'mini-player stays absent without a document');
+});
+test('OCR-01 aparat i galeria prowadzą przez podgląd, edycję i istniejący zapis Lektora', async () => {
+    const idb=memoryIndexedDB();
+    let createCalls=0, terminated=0;
+    const tesseract={async createWorker(language, mode, options) {
+        createCalls++;
+        assert.equal(language,'pol'); assert.equal(mode,1);
+        assert.equal(options.langPath,'https://example.test/ocr-probe-assets');
+        options.logger({status:'recognizing text',progress:.55});
+        return {recognize: async () => ({data:{text:'Ala ma kota. Drugie zdanie.'}}),
+            terminate: async () => {terminated++;}};
+    }};
+    const h=harness(async()=>ok(),' ',true,true,idb,{tesseract,
+        createImageBitmap:async(_file,options)=>{
+            assert.equal(options.imageOrientation,'from-image');
+            return {width:900,height:1400,close(){}};
+        }});
+    await settle();
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    assert.equal(h.context.document.getElementById('ocrImport').hidden,false);
+    h.run("window.chooseOcrPhoto('camera'); window.chooseOcrPhoto('gallery')");
+    assert.equal(h.context.document.getElementById('ocrCameraInput').clickCount,1);
+    assert.equal(h.context.document.getElementById('ocrGalleryInput').clickCount,1);
+    const file=new Blob(['photo'],{type:'image/jpeg'}); file.name='private-photo.jpg';
+    await h.context.document.getElementById('ocrCameraInput').listeners.change({target:{files:[file],value:'private-photo.jpg'}});
+    assert.equal(h.context.document.getElementById('ocrPreview').hidden,false);
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,false);
+    assert.equal(idb.data.size,0,'selecting a photo does not persist it');
+    await h.run('window.runOcr()');
+    assert.equal(createCalls,1); assert.equal(terminated,1);
+    assert.equal(h.context.document.getElementById('ocrText').hidden,false);
+    assert.equal(h.context.document.getElementById('ocrText').value,'Ala ma kota. Drugie zdanie.');
+    h.context.document.getElementById('ocrText').value='Poprawione zdanie. Drugie poprawione.';
+    h.run('window.applyOcrText()'); await settle();
+    const acceptedId=h.run('currentDocument.id');
+    h.run('window.applyOcrText()');
+    assert.equal(h.run('currentDocument.id'),acceptedId,'double tap cannot create a second document');
+    assert.equal(h.run('currentDocument.name'),'Tekst ze zdjęcia');
+    assert.equal(h.run('currentDocument.text'),'Poprawione zdanie. Drugie poprawione.');
+    assert.equal(h.run('sentences.length'),2);
+    assert.equal(h.context.document.getElementById('addContentDialog').open,false);
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    assert.equal(h.context.document.getElementById('addContentDialog').open,true,'OCR dialog reopens after acceptance');
+    assert.equal(h.context.document.getElementById('ocrText').value,'');
+    h.run('window.closeAddContentDialog()');
+    const record=latestDocument(idb);
+    assert.equal(record.text,'Poprawione zdanie. Drugie poprawione.');
+    assert.equal(JSON.stringify(record).includes('private-photo.jpg'),false);
+    assert.equal(idb.sessions.size,0,'OCR and document save do not invent a listening session');
+    h.run('window.startFrom(0)'); await settle();
+    h.run('audio.dispatch("playing")'); await settle();
+    assert.equal(idb.sessions.size,1,'normal playback records the OCR document in history');
+    assert.equal([...idb.sessions.values()][0].documentId,record.id);
+});
+test('OCR-01 anulowanie i zmiana dokumentu odrzucają spóźniony wynik i zwalniają worker', async () => {
+    let resolveRecognition, terminated=0;
+    const tesseract={async createWorker() { return {recognize: () => new Promise(resolve=>{resolveRecognition=resolve;}),
+        terminate: async () => {terminated++;}}; }};
+    const h=harness(async()=>ok(),' ',true,null,null,{tesseract});
+    const photo=new Blob(['photo'],{type:'image/png'});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[photo],value:'photo'}});
+    const first=h.run('window.runOcr()');
+    await h.run('window.runOcr()');
+    for(let i=0;i<12 && !resolveRecognition;i++)await Promise.resolve();
+    assert.ok(resolveRecognition);
+    h.run('window.cancelOcrRecognition()');
+    resolveRecognition({data:{text:'Spóźnione zdanie.'}});
+    await first;
+    assert.equal(terminated,1);
+    assert.equal(h.context.document.getElementById('ocrText').hidden,true);
+    assert.equal(h.run('currentDocument'),null);
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,false,'same preview can be retried');
+
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[photo],value:'photo'}});
+    resolveRecognition=null;
+    const second=h.run('window.runOcr()');
+    for(let i=0;i<12 && !resolveRecognition;i++)await Promise.resolve();
+    h.run('renderSentences("Nowy dokument.", [], {name:"nowy.txt"})');
+    resolveRecognition({data:{text:'Stary wynik OCR.'}});
+    await second;
+    assert.equal(terminated,2);
+    assert.equal(h.run('currentDocument.name'),'nowy.txt');
+    assert.equal(h.context.document.getElementById('ocrText').value,'');
+});
+test('OCR-01 odrzuca nieobsługiwany i zbyt duży obraz bez zmiany dokumentu', async () => {
+    let calls=0;
+    const h=harness(async()=>ok(),' ',true,null,null,{tesseract:{async createWorker(){calls++;throw Error('unneeded');}}});
+    h.run('renderSentences("Istniejący dokument.",[],{name:"zapis.txt"})');
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const input=h.context.document.getElementById('ocrGalleryInput');
+    await input.listeners.change({target:{files:[new Blob(['x'],{type:'image/svg+xml'})],value:'x'}});
+    assert.match(h.context.document.getElementById('ocrStatus').textContent,/JPEG, PNG lub WebP/);
+    const large={type:'image/jpeg',size:13*1024*1024};
+    await input.listeners.change({target:{files:[large],value:'large'}});
+    assert.match(h.context.document.getElementById('ocrStatus').textContent,/do 12 MB/);
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,true);
+    assert.equal(h.run('currentDocument.name'),'zapis.txt');
+    assert.equal(calls,0);
+    const pixels=harness(async()=>ok(),' ',true,null,null,{tesseract:{async createWorker(){throw Error('unneeded');}},
+        createImageBitmap:async()=>({width:5000,height:4000,close(){}})});
+    pixels.run('window.openAddContentDialog(); window.showPhotoImport()');
+    await pixels.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[new Blob(['x'],{type:'image/jpeg'})],value:'x'}});
+    assert.match(pixels.context.document.getElementById('ocrStatus').textContent,/16 MP/);
+    assert.equal(pixels.context.document.getElementById('ocrRun').disabled,true);
+});
+test('OCR-01 ładuje Tesseract na żądanie, pokazuje postęp i pozwala poprawić pusty wynik', async () => {
+    let scripts=0, workers=0;
+    const h=harness(async()=>ok(),' ',true,null,null,{onScript(script, window) {
+        scripts++;
+        assert.equal(script.src,'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js');
+        window.Tesseract={async createWorker(_lang,_mode,options) {
+            workers++;
+            options.logger({status:'recognizing text',progress:.6});
+            assert.equal(h.context.document.getElementById('ocrProgress').value,60);
+            return {recognize: async()=>({data:{text:''}}),terminate:async()=>{}};
+        }};
+        script.onload();
+    }});
+    assert.equal(scripts,0,'normal reader does not download OCR JavaScript');
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    assert.equal(scripts,0,'photo preview itself does not download OCR JavaScript');
+    const photo=new Blob(['x'],{type:'image/webp'});
+    await h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[photo],value:'x'}});
+    await h.run('window.runOcr()');
+    assert.equal(scripts,1); assert.equal(workers,1);
+    assert.equal(h.context.document.getElementById('ocrText').hidden,false);
+    h.run('window.applyOcrText()');
+    assert.match(h.context.document.getElementById('ocrStatus').textContent,/Popraw lub wpisz/);
+    h.context.document.getElementById('ocrText').value='Wpisany po OCR tekst.';
+    h.run('window.applyOcrText()');
+    assert.equal(h.run('currentDocument.text'),'Wpisany po OCR tekst.');
+});
+test('OCR-01 zamknięcie dialogu podczas inicjalizacji unieważnia wynik i zwalnia spóźnionego workera', async () => {
+    let resolveWorker, terminated=0;
+    const tesseract={createWorker:()=>new Promise(resolve=>{resolveWorker=resolve;})};
+    const h=harness(async()=>ok(),' ',true,null,null,{tesseract});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const photo=new Blob(['photo'],{type:'image/jpeg'});
+    await h.context.document.getElementById('ocrCameraInput').listeners.change({target:{files:[photo],value:'photo'}});
+    const running=h.run('window.runOcr()');
+    for(let i=0;i<12 && !resolveWorker;i++)await Promise.resolve();
+    assert.ok(resolveWorker);
+    h.run('window.closeAddContentDialog()');
+    resolveWorker({recognize:async()=>({data:{text:'Spóźniony tekst.'}}),terminate:async()=>{terminated++;}});
+    await running;
+    for(let i=0;i<8;i++)await Promise.resolve();
+    assert.equal(terminated,1);
+    assert.equal(h.run('currentDocument'),null);
+    assert.equal(h.context.document.getElementById('ocrPreview').width,0);
+    assert.equal(h.context.document.getElementById('ocrText').value,'');
+});
+test('OCR-01 zmiana zakładki anuluje OCR bez przerywania bieżącego odtwarzania', async () => {
+    let resolveRecognition, terminated=0;
+    const tesseract={async createWorker() { return {recognize:()=>new Promise(resolve=>{resolveRecognition=resolve;}),
+        terminate:async()=>{terminated++;}}; }};
+    const h=harness(async()=>ok(),' ',true,true,null,{tesseract});
+    h.run('renderSentences("Aktualny dokument.",[],{name:"aktualny.txt"}); window.startFrom(0)');
+    await settle();
+    const player=h.audios.at(-1), session=h.run('session');
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const photo=new Blob(['photo'],{type:'image/jpeg'});
+    await h.context.document.getElementById('ocrCameraInput').listeners.change({target:{files:[photo],value:'photo'}});
+    const running=h.run('window.runOcr()');
+    for(let i=0;i<12 && !resolveRecognition;i++)await Promise.resolve();
+    assert.ok(resolveRecognition);
+    assert.equal(h.run('session'),session,'OCR does not restart the audio session');
+    assert.equal(h.audios.at(-1),player);
+    h.run("window.switchTab('history')");
+    resolveRecognition({data:{text:'Nieaktualny OCR.'}});
+    await running;
+    assert.equal(terminated,1);
+    assert.equal(h.run('currentDocument.name'),'aktualny.txt');
+    assert.equal(h.run('session'),session);
+    assert.equal(h.audios.at(-1),player);
+    assert.equal(h.context.document.getElementById('addContentDialog').open,false);
+});
+test('OCR-01 błąd pobrania biblioteki pozostawia dokument i pozwala ponowić OCR', async () => {
+    let attempts=0;
+    const h=harness(async()=>ok(),' ',true,null,null,{onScript(script, window) {
+        attempts++;
+        if(attempts===1)script.onerror();
+        else {
+            window.Tesseract={async createWorker(){return {recognize:async()=>({data:{text:'Odzyskany tekst.'}}),terminate:async()=>{}};}};
+            script.onload();
+        }
+    }});
+    h.run('renderSentences("Istniejący tekst.",[],{name:"stary.txt"})');
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const photo=new Blob(['photo'],{type:'image/jpeg'});
+    await h.context.document.getElementById('ocrCameraInput').listeners.change({target:{files:[photo],value:'photo'}});
+    await h.run('window.runOcr()');
+    assert.match(h.context.document.getElementById('ocrStatus').textContent,/nie powiodło/);
+    assert.equal(h.run('currentDocument.name'),'stary.txt');
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,false);
+    await h.run('window.runOcr()');
+    assert.equal(attempts,2);
+    assert.equal(h.context.document.getElementById('ocrText').value,'Odzyskany tekst.');
+});
+test('OCR-01 brak modułu OCR nie blokuje zwykłego importu i Lektora', async () => {
+    const h=harness(async()=>ok(),' ',true,null,null,{skipModule:true});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    assert.match(h.context.document.getElementById('importStatus').textContent,/chwilowo niedostępny/);
+    h.run('window.showTextImport()');
+    h.context.document.getElementById('rawText').value='Zwykły tekst działa.';
+    h.run('window.applyText()'); await settle();
+    assert.equal(h.run('currentDocument.text'),'Zwykły tekst działa.');
+    h.run('window.startFrom(0)'); await settle();
+    assert.equal(h.run('isReading'),true);
+});
+test('OCR-01 spóźnione dekodowanie zdjęcia nie zasłania nowo otwartego dokumentu', async () => {
+    let resolveBitmap, closed=0;
+    const h=harness(async()=>ok(),' ',true,null,null,{createImageBitmap:()=>new Promise(resolve=>{resolveBitmap=resolve;})});
+    h.run('window.openAddContentDialog(); window.showPhotoImport()');
+    const photo=new Blob(['photo'],{type:'image/png'});
+    const decoding=h.context.document.getElementById('ocrGalleryInput').listeners.change({target:{files:[photo],value:'photo'}});
+    assert.ok(resolveBitmap);
+    h.run('renderSentences("Nowszy dokument.",[],{name:"nowszy.txt"})');
+    resolveBitmap({width:1200,height:800,close(){closed++;}});
+    await decoding;
+    assert.equal(closed,1);
+    assert.equal(h.run('currentDocument.name'),'nowszy.txt');
+    assert.equal(h.context.document.getElementById('ocrPreview').hidden,true);
+    assert.equal(h.context.document.getElementById('ocrRun').disabled,true);
 });
 (async () => {
     for (const [name, fn] of cases) {
