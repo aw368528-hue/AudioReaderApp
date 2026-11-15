@@ -99,9 +99,14 @@ function memoryIndexedDB() {
 function harness(fetch, query = '', withMediaSession = true, mseSupport = null, indexedDBApi = null) {
     const elements = new Map();
     function element() {
-        return {value: '', style: {}, innerText: '', innerHTML: '', children: [],
-            classList: {toggle() {}, add() {}, remove() {}}, listeners: {}, click() { this.listeners.click?.({target:this}); }, remove() {},
-            appendChild(child) { this.children.push(child); }, addEventListener(type, callback) { this.listeners[type] = callback; }, scrollIntoView() {}};
+        const classes = new Set();
+        return {value: '', style: {}, innerText: '', innerHTML: '', children: [], hidden: false, attributes: {}, clickCount: 0,
+            classList: {toggle(name, force) { const active=force === undefined ? !classes.has(name) : !!force; if(active)classes.add(name);else classes.delete(name);return active; }, add(name) { classes.add(name); }, remove(...names) { names.forEach(name=>classes.delete(name)); }, contains(name) { return classes.has(name); }},
+            listeners: {}, click() { this.clickCount++; this.onclick?.({target:this}); this.listeners.click?.({target:this}); }, remove() {},
+            focus() { this.focused = true; }, setAttribute(name,value) { this.attributes[name]=String(value); },
+            showModal() { this.showModalCalls=(this.showModalCalls||0)+1; if(this.hidden)throw Error('dialog_hidden'); this.open=true; }, close() { this.open=false; this.listeners.close?.({target:this}); },
+            dispatch(type, event={}) { this.listeners[type]?.({type,target:this,...event}); },
+            appendChild(child) { this.children.push(child); }, addEventListener(type, callback) { this.listeners[type] = callback; }, scrollIntoView() { this.scrollCount=(this.scrollCount||0)+1; }};
     }
     const audios = [];
     const revoked = [];
@@ -166,7 +171,7 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
         navigator: {clipboard: {writeText: async text => { context.copied = text; }}, ...(withMediaSession ? {mediaSession} : {})},
         MediaMetadata: class MediaMetadata { constructor(data) { Object.assign(this, data); } },
         performance: {now: () => performanceTime}, document: {body, visibilityState: 'visible',
-        addEventListener(type, callback) { documentListeners[type] = callback; },
+        addEventListener(type, callback) { documentListeners[type] = callback; }, activeElement: null,
         getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
         createElement: element, querySelectorAll: () => []}, Audio, ...(mseSupport === null ? {} : {MediaSource}), fetch, FormData, AbortController,
         DOMException, TypeError, URL: {createObjectURL: blob => {
@@ -473,7 +478,7 @@ test('TXT-01: układ oddzielony od tekstu mówionego, dokładna treść wysłana
     h.run(`renderSentences(${JSON.stringify(input)})`);
     const spoken='Wszystkie trzy dokumenty chcą deterministycznego Risk Engine z prawem veta, bez pominięć.';
     assert.deepEqual(Array.from(h.run('sentences')), [spoken]);
-    assert.equal(h.context.document.getElementById('readerView').children[0].innerText, input);
+    assert.equal(h.context.document.getElementById('sentenceList').children[0].innerText, input);
     h.run('window.startFrom(0)'); await settle();
     assert.deepEqual(h.sent,[spoken]);
     assert.deepEqual(spoken.split(/\s+/),input.split(/\s+/));
@@ -500,7 +505,7 @@ test('TXT-02: dokładny przykład użytkownika i wszystkie pola w jednym wierszu
     const captured=[];
     const h=harness(async(url, options)=>{captured.push(options.body.get('text'));return ok();});
     h.run(`renderSentences(${JSON.stringify(original)})`);
-    const visible=h.context.document.getElementById('readerView').children.map(node=>node.innerText.replace(/\s+/gu,' ').trim());
+    const visible=h.context.document.getElementById('sentenceList').children.map(node=>node.innerText.replace(/\s+/gu,' ').trim());
     assert.deepEqual(visible,expected);
     for(let idx=0;idx<expected.length;idx++)await h.run(`fetchAudioBlob(${idx})`);
     assert.deepEqual(captured,expected);
@@ -1512,6 +1517,8 @@ test('UX-01 wklejony tekst i miejsce wracają lokalnie bez automatycznego odtwar
     assert.equal(reopened.context.document.getElementById('voiceSelect').value, 'pl-PL-MarekNeural');
     assert.equal(reopened.context.document.getElementById('rateSlider').value, '20');
     assert.equal(reopened.context.document.getElementById('resumeContinue').hidden, false);
+    assert.equal(reopened.context.document.getElementById('resumeContinue').textContent, 'Kontynuuj');
+    assert.equal(reopened.context.document.getElementById('resumeContinue').attributes['aria-label'], 'Kontynuuj czytanie od zapisanego miejsca');
     assert.equal(reopenedFetches, 0, 'restoring a document does not send it to the backend or generate TTS');
     assert.match(reopened.context.document.getElementById('resumeNote').textContent, /lokalnie w tej przeglądarce/);
     reopened.run('window.continueSavedDocument()'); await settle();
@@ -1586,7 +1593,8 @@ test('UX-01 końcówka dokumentu zapisuje ukończenie i pozwala zacząć od pocz
     await settle();
     assert.equal(reopened.run('isReading'), false);
     assert.equal(reopened.run('currentIdx'), 1);
-    assert.equal(reopened.context.document.getElementById('resumeContinue').textContent, 'Czytaj od początku');
+    assert.equal(reopened.context.document.getElementById('resumeContinue').textContent, 'Od początku');
+    assert.equal(reopened.context.document.getElementById('resumeContinue').attributes['aria-label'], 'Czytaj ukończony dokument od początku');
     reopened.run('window.continueSavedDocument()'); await settle();
     assert.equal(reopened.run('currentIdx'), 0);
     assert.equal(reopened.run('isReading'), true);
@@ -1648,6 +1656,124 @@ test('UX-01 brak IndexedDB lub quota nie blokuje odtwarzania', async () => {
     quota.run('window.startFrom(0)'); await settle();
     assert.equal(quota.run('isReading'), true);
     assert.equal(quota.audios.at(-1).plays, 1);
+});
+test('UI-01 dwa widoki zachowują aktywną sesję i pokazują mini-odtwarzacz', async () => {
+    const h=harness(async()=>ok());
+    h.context.document.getElementById('rawText').value='Pierwsze zdanie. Drugie zdanie.';
+    h.run('window.applyText()'); await settle();
+    h.run("window.startFrom(0)"); await settle();
+    const player=h.audios.at(-1), token=h.run('session');
+    h.context.document.getElementById('voiceSelect').value='pl-PL-MarekNeural';
+    h.context.document.getElementById('rateSlider').value='20';
+    h.run("window.switchTab('history')"); await settle();
+    assert.equal(h.run('session'),token,'view change does not restart audio session');
+    assert.equal(h.audios.at(-1),player,'view change preserves the same audio element');
+    assert.equal(h.run('currentDocument.name'),'Wklejony tekst');
+    assert.equal(h.context.document.getElementById('miniPlayer').hidden,false);
+    assert.equal(h.context.document.getElementById('miniPlayerTitle').textContent,'Wklejony tekst');
+    assert.equal(h.context.document.body.classList.contains('history-active'),true);
+    h.run('window.togglePlay()');
+    assert.equal(h.run('isPaused'),true,'mini-player control respects normal pause behavior');
+    h.run("window.switchTab('reader')");
+    assert.equal(h.context.document.body.classList.contains('history-active'),false);
+    assert.equal(h.context.document.getElementById('miniPlayer').hidden,true,'reader uses the full player without a duplicate mini-player');
+});
+test('UI-01 dialog importu zachowuje roboczy tekst i otwiera wybraną treść', () => {
+    const h=harness(async()=>ok());
+    h.run('window.openAddContentDialog()');
+    const dialog=h.context.document.getElementById('addContentDialog');
+    assert.equal(dialog.open,true);
+    h.run('window.showTextImport()');
+    assert.equal(h.context.document.getElementById('textImportForm').hidden,false);
+    h.context.document.getElementById('rawText').value='Roboczy tekst bez utraty.';
+    h.run('window.closeAddContentDialog()');
+    assert.equal(h.context.document.getElementById('rawText').value,'Roboczy tekst bez utraty.');
+    h.run('window.openAddContentDialog(); window.showTextImport(); window.applyText()');
+    assert.equal(dialog.open,false);
+    assert.equal(h.run('activeTab'),'reader');
+    assert.equal(h.run('currentDocument.name'),'Wklejony tekst');
+    assert.equal(h.context.document.getElementById('resumePanel').hidden,true,'no persistent save panel before a record exists');
+    h.run('window.openAddContentDialog(); window.chooseFileImport()');
+    assert.equal(h.context.document.getElementById('fileInput').clickCount,1);
+    assert.equal(dialog.open,false);
+});
+test('UI-01 dialog natywny można ponownie otworzyć po sukcesie, anulowaniu, błędzie i Escape', async () => {
+    let failUpload=false, imports=0;
+    const h=harness(async url=>{
+        if(url!=='/upload')return ok();
+        imports++;
+        if(failUpload)return {ok:false,status:503};
+        return {ok:true,json:async()=>({text:`Zaimportowany plik ${imports}.`,blocks:[]})};
+    });
+    const dialog=h.context.document.getElementById('addContentDialog');
+    const input=h.context.document.getElementById('fileInput');
+    async function upload(name) {
+        const file=new Blob([name]); file.name=name;
+        await input.listeners.change({target:{files:[file],value:name}});
+        await settle();
+    }
+    h.run('window.openAddContentDialog(); window.chooseFileImport()');
+    await upload('one.txt');
+    assert.equal(dialog.open,false);
+    assert.equal(dialog.hidden,false,'closing a native dialog does not set hidden');
+    h.run('window.openAddContentDialog()');
+    assert.equal(dialog.open,true,'first successful upload leaves the dialog reusable');
+    h.run('window.chooseFileImport()'); // File picker is cancelled; no change event follows.
+    h.run('window.openAddContentDialog()');
+    assert.equal(dialog.open,true,'cancelled file selection leaves the dialog reusable');
+    h.run('window.chooseFileImport()');
+    await upload('two.txt');
+    assert.equal(imports,2,'consecutive successful imports both reach the upload handler');
+    assert.equal(dialog.hidden,false);
+    failUpload=true;
+    h.run('window.openAddContentDialog(); window.chooseFileImport()');
+    await upload('broken.txt');
+    assert.equal(dialog.open,true,'upload errors reopen the import dialog with contextual status');
+    assert.match(h.context.document.getElementById('importStatus').textContent,/Nie udało się wczytać/);
+    dialog.dispatch('cancel'); // Native cancel is the event generated by Escape.
+    dialog.open=false;
+    dialog.dispatch('close');
+    h.run('window.openAddContentDialog()');
+    assert.equal(dialog.open,true,'Escape does not leave hidden set');
+    assert.equal(dialog.hidden,false);
+    assert.ok(dialog.showModalCalls>=5);
+});
+test('UI-01 przejście zdań w historii nie przewija ani nie przełącza widoku', async () => {
+    const h=harness(async()=>ok());
+    h.run('renderSentences("Pierwsze. Drugie.",[],{name:"Czytany dokument"}); window.startFrom(0)');
+    await settle();
+    h.run("window.switchTab('history')");
+    h.audios.at(-1).onended(); await settle();
+    assert.equal(h.run('activeTab'),'history');
+    assert.equal(h.context.document.getElementById('sent-1').scrollCount||0,0);
+});
+test('UX-02 historia opisuje start, opcjonalny koniec i krótki czas odsłuchu', () => {
+    const h=harness(async()=>ok());
+    h.run(`historyDocuments=[]; historySessions=[
+        {id:'live',documentId:'gone-a',documentName:'Aktywna sesja',startedAt:Date.UTC(2026,10,15,10,0),playedMs:13000,status:'paused'},
+        {id:'done',documentId:'gone-b',documentName:'Krótka sesja',startedAt:Date.UTC(2026,10,15,11,0),endedAt:Date.UTC(2026,10,15,11,1),playedMs:65000,status:'completed'}
+    ]; selectedHistoryDay='2026-11-15'; renderHistory()`);
+    const rows=h.context.document.getElementById('historyList').children;
+    assert.equal(rows.length,2);
+    const liveMeta=rows[0].children[0].children[1].innerText;
+    assert.match(liveMeta,/Start:/);
+    assert.doesNotMatch(liveMeta,/Koniec:/);
+    assert.match(liveMeta,/Czas: 0:13/);
+    assert.doesNotMatch(liveMeta,/0 min/);
+    const doneMeta=rows[1].children[0].children[1].innerText;
+    assert.match(doneMeta,/Start:/);
+    assert.match(doneMeta,/Koniec:/);
+    assert.match(doneMeta,/Czas: 1:05/);
+});
+test('UI-01 ustawienia są opcjonalnym panelem z kontrolą stanu dostępności', () => {
+    const h=harness(async()=>ok());
+    const panel=h.context.document.getElementById('settingsPanel');
+    h.run('window.toggleSettings(true)');
+    assert.equal(panel.hidden,false);
+    assert.equal(h.context.document.getElementById('settingsToggle').attributes['aria-expanded'],'true');
+    h.run('window.toggleSettings(false)');
+    assert.equal(panel.hidden,true);
+    assert.equal(h.context.document.getElementById('miniPlayer').hidden,true,'mini-player stays absent without a document');
 });
 (async () => {
     for (const [name, fn] of cases) {

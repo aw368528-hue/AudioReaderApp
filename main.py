@@ -47,7 +47,7 @@ HTML_PAGE = """
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="theme-color" content="#121316">
     <link rel="manifest" href="/manifest.json">
     <title>AudioReader AI</title>
@@ -67,32 +67,58 @@ HTML_PAGE = """
         body {
             font-family: 'Inter', -apple-system, sans-serif;
             background: var(--bg); color: var(--text);
-            margin: 0; padding: 14px; height: 100dvh;
-            display: flex; flex-direction: column; gap: 12px; overflow: hidden;
+            margin: 0; padding: max(10px, env(safe-area-inset-top)) 12px max(10px, env(safe-area-inset-bottom));
+            height: 100dvh; min-height: 100dvh;
+            display: flex; flex-direction: column; gap: 9px; overflow: hidden;
         }
-        .header { display: flex; justify-content: space-between; align-items: center; }
-        .logo { display: flex; align-items: center; gap: 10px; font-size: 1.25rem; font-weight: 700; }
-        .logo span { color: var(--primary); font-size: 1.5rem; }
+        .header { position: relative; display: flex; justify-content: space-between; align-items: center; min-height: 38px; flex: 0 0 auto; }
+        .logo { display: flex; align-items: center; gap: 8px; min-width: 0; white-space: nowrap; font-size: clamp(1rem, 4vw, 1.2rem); font-weight: 700; }
+        .logo span { color: var(--primary); font-size: 1.25rem; }
         .header-actions { display: flex; gap: 8px; }
         .btn-tonal {
             background: var(--surface-light); color: var(--text);
             border: none; padding: 8px 14px; border-radius: 20px;
             font-weight: 600; font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; gap: 6px;
         }
-        .tabs { display: flex; gap: 8px; }
+        .tabs { display: flex; gap: 8px; flex: 0 0 auto; }
         .tab-btn {
-            flex: 1; padding: 10px; border-radius: 20px; border: none;
+            flex: 1; min-width: 0; min-height: 44px; padding: 9px 12px; border-radius: 20px; border: none;
             background: var(--surface); color: var(--text-muted);
             font-weight: 600; font-size: 0.9rem; cursor: pointer; transition: 0.2s;
         }
         .tab-btn.active { background: var(--primary); color: white; }
         .view-box {
-            flex: 1; background: var(--surface); border-radius: 16px;
-            padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;
+            flex: 1; min-height: 0; min-width: 0; background: var(--surface); border-radius: 16px;
+            padding: 12px; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 8px;
         }
+        .app-views { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; }
+        #readerView { overflow: hidden; }
+        .reader-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+        #sentenceList { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+        .history-scroll { min-height: 0; display: flex; flex-direction: column; gap: 10px; overflow: auto; overscroll-behavior: contain; }
+        #historyView { overflow: hidden; }
+        .history-scroll { flex: 1 1 auto; }
+        #calendarView[hidden] { display: none; }
+        .reader-toolbar { display: flex; flex-direction: column; align-items: stretch; gap: 6px; flex: 0 0 auto; min-width: 0; }
+        .doc-title { width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .88rem; font-weight: 600; }
+        .reader-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+        .add-content-btn, .resume-actions button, .library-entry button, .history-entry button, .history-toolbar button {
+            min-height: 44px; border: 0; border-radius: 12px; padding: 9px 12px; color: var(--text);
+            background: var(--surface-light); font: inherit; font-weight: 600; cursor: pointer;
+        }
+        .add-content-btn { background: var(--primary); color: white; white-space: nowrap; }
+        .resume-panel { flex: 0 0 auto; width: fit-content; max-width: 100%; padding: 0; background: none; border: 0; }
+        .resume-copy, .resume-note { display: none; }
+        .resume-actions { display: flex; }
+        .resume-actions button.primary { background: var(--surface-light); color: var(--text); }
+        .resume-status { min-width: 0; font-size: .76rem; color: var(--text-muted); overflow-wrap: anywhere; }
+        .reader-empty { display: flex; flex: 1; min-height: 160px; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 18px; color: var(--text-muted); text-align: center; }
+        .reader-empty[hidden], .document-title[hidden] { display: none; }
+        .import-status { min-height: 0; color: var(--text-muted); font-size: .82rem; overflow-wrap: anywhere; }
+        .import-status:empty { display: none; }
         .sentence {
             padding: 12px 14px; border-radius: 12px; font-size: 1.02rem; line-height: 1.5;
-            cursor: pointer; transition: 0.15s; border: 1px solid transparent;
+            cursor: pointer; transition: 0.15s; border: 1px solid transparent; overflow-wrap: anywhere;
         }
         .sentence:hover { background: var(--surface-light); }
         .sentence.active {
@@ -110,7 +136,7 @@ HTML_PAGE = """
         .player-card {
             background: var(--surface); border-radius: 20px; padding: 14px 16px;
             display: flex; flex-direction: column; gap: 10px;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.25);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.25); flex: 0 0 auto;
         }
         .progress-bg { height: 5px; background: var(--surface-light); border-radius: 3px; overflow: hidden; }
         .progress-fill { height: 100%; width: 0%; background: var(--primary); transition: width 0.2s; }
@@ -118,10 +144,10 @@ HTML_PAGE = """
         .controls-row { display: flex; justify-content: center; align-items: center; gap: 22px; }
         .icon-btn {
             background: none; border: none; color: var(--text); font-size: 1.5rem;
-            cursor: pointer; padding: 8px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+            cursor: pointer; padding: 8px; min-width: 44px; min-height: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
         }
         .play-btn {
-            background: var(--primary); color: white; width: 56px; height: 56px;
+            background: var(--primary); color: white; width: 60px; height: 60px;
             font-size: 1.6rem; box-shadow: 0 4px 12px rgba(59,130,246,0.4);
         }
         .settings-row { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; }
@@ -130,44 +156,84 @@ HTML_PAGE = """
             padding: 8px 12px; border-radius: 10px; font-weight: 500; outline: none;
         }
         input[type="range"] { flex: 1; accent-color: var(--primary); }
-        .resume-panel {
-            background: var(--surface); border: 1px solid var(--surface-light); border-radius: 12px;
-            padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px;
-            color: var(--text-muted); font-size: 0.78rem;
-        }
         .resume-panel[hidden] { display: none; }
-        .resume-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-        .resume-title { color: var(--text); font-weight: 600; }
-        .resume-name { overflow-wrap: anywhere; }
-        .resume-note { font-size: 0.68rem; }
-        .resume-actions { display: flex; flex: 0 0 auto; gap: 6px; }
-        .resume-actions button {
-            border: 0; border-radius: 9px; padding: 8px 10px; font: inherit; font-weight: 600;
-            color: var(--text); background: var(--surface-light); cursor: pointer;
-        }
-        .resume-actions button.primary { background: var(--primary); color: white; }
+        .resume-actions { display: flex; gap: 6px; }
         .resume-actions button[hidden] { display: none; }
         .history-toolbar, .history-nav, .history-entry, .library-entry { display: flex; align-items: center; gap: 8px; }
         .history-toolbar, .history-nav { justify-content: space-between; }
-        .history-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
-        .history-grid button, .history-nav button, .history-toolbar button, .history-entry button, .library-entry button {
+        .history-subnav { display: flex; gap: 8px; }
+        .history-subnav button { flex: 1; min-height: 44px; border: 0; border-radius: 12px; color: var(--text-muted); background: var(--bg); font: inherit; font-weight: 600; }
+        .history-subnav button.active { color: white; background: var(--primary); }
+        .history-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; width: 100%; }
+        .history-grid button, .history-nav button {
             min-height: 44px; border: 0; border-radius: 10px; padding: 8px; color: var(--text);
             background: var(--surface-light); font: inherit; cursor: pointer;
         }
-        .history-grid .history-weekday { min-height: auto; padding: 4px 0; background: transparent; color: var(--text-muted); font-size: .72rem; }
+        .history-grid .history-weekday { min-height: 28px; display: grid; place-items: center; padding: 3px 0; background: transparent; color: var(--text-muted); font-size: .72rem; }
         .history-grid button.has-sessions { outline: 2px solid var(--primary); }
         .history-grid button.selected { background: var(--primary); color: white; }
         .history-grid button.empty { visibility: hidden; }
-        .history-list, .library-list { display: flex; flex-direction: column; gap: 8px; }
+        .history-list, .library-list { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
         .library-list[hidden], #calendarView[hidden] { display: none; }
         .history-entry, .library-entry { justify-content: space-between; background: var(--bg); border-radius: 10px; padding: 8px; }
-        .history-entry > div, .library-entry > div { min-width: 0; overflow-wrap: anywhere; }
+        .history-entry-copy, .library-entry-copy { display: flex; flex: 1 1 auto; min-width: 0; flex-direction: column; gap: 3px; }
+        .history-entry-title, .library-entry-title { display: -webkit-box; overflow: hidden; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; font-weight: 600; }
+        .history-entry-meta, .library-entry-meta { color: var(--text-muted); font-size: .75rem; overflow-wrap: anywhere; }
         .history-entry button, .library-entry button { flex: 0 0 auto; }
         .history-empty { color: var(--text-muted); text-align: center; padding: 20px 8px; }
-        @media (max-width: 520px) {
-            .resume-panel { align-items: flex-start; flex-direction: column; }
-            .resume-actions { width: 100%; }
-            .resume-actions button { flex: 1; }
+        .settings-panel { position: absolute; z-index: 5; top: calc(100% + 8px); right: 0; width: min(300px, calc(100vw - 24px)); padding: 14px; border: 1px solid var(--surface-light); border-radius: 14px; background: var(--surface); box-shadow: 0 8px 28px rgba(0,0,0,.32); }
+        .settings-panel[hidden] { display: none; }
+        .settings-panel p { margin: 10px 0 0; color: var(--text-muted); font-size: .78rem; line-height: 1.45; }
+        .settings-panel button { min-height: 44px; width: 100%; border: 0; border-radius: 10px; color: var(--text); background: var(--surface-light); font: inherit; font-weight: 600; }
+        .settings-btn { width: 44px; height: 44px; border: 0; border-radius: 50%; color: var(--text); background: var(--surface-light); font-size: 1.15rem; cursor: pointer; }
+        .add-content-dialog { width: min(100%, 560px); max-height: min(90dvh, 760px); margin: auto; padding: 0; border: 1px solid var(--surface-light); border-radius: 20px; color: var(--text); background: var(--surface); box-shadow: 0 16px 50px rgba(0,0,0,.4); overflow: auto; }
+        .add-content-dialog::backdrop { background: rgba(0,0,0,.62); }
+        .sheet-content { display: flex; flex-direction: column; gap: 14px; padding: 18px; }
+        .sheet-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+        .sheet-heading h2 { margin: 0; font-size: 1.05rem; }
+        .sheet-close { width: 44px; height: 44px; border: 0; border-radius: 50%; color: var(--text); background: var(--surface-light); font-size: 1.2rem; }
+        .import-options { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
+        .import-options button { min-height: 64px; border: 1px solid var(--surface-light); border-radius: 14px; color: var(--text); background: var(--bg); font: inherit; font-weight: 600; }
+        .text-import-form[hidden] { display: none; }
+        .text-import-form { display: flex; min-height: min(45dvh, 340px); flex-direction: column; gap: 10px; }
+        .text-import-form textarea { min-height: 150px; }
+        .mini-player { display: flex; align-items: center; gap: 10px; min-height: 58px; flex: 0 0 auto; padding: 7px 10px; border: 1px solid var(--surface-light); border-radius: 16px; background: var(--surface); }
+        .mini-player[hidden] { display: none; }
+        .mini-player-main { display: flex; flex: 1 1 auto; min-width: 0; flex-direction: column; gap: 2px; cursor: pointer; }
+        .mini-player-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .82rem; font-weight: 600; }
+        .mini-player-status { color: var(--text-muted); font-size: .72rem; }
+        .mini-player button { width: 44px; height: 44px; flex: 0 0 auto; border: 0; border-radius: 50%; color: white; background: var(--primary); font-size: 1.15rem; }
+        body.history-active .player-card { display: none; }
+        body.history-active .mini-player[hidden] { display: none; }
+        body.modal-open .player-card, body.modal-open .mini-player { display: none; }
+        body.keyboard-open .player-card { display: none; }
+        @media (max-width: 600px) {
+            .add-content-dialog { position: fixed; inset: auto 0 0; width: 100%; max-width: none; max-height: min(88dvh, 760px); margin: 0; border-radius: 20px 20px 0 0; }
+            .sheet-content { padding-bottom: max(18px, env(safe-area-inset-bottom)); }
+        }
+        @media (max-width: 480px) {
+            .history-toolbar { align-items: stretch; flex-direction: column; }
+            .history-subnav { width: 100%; }
+            .history-subnav button { flex: 1 1 0; white-space: nowrap; }
+        }
+        @media (max-width: 360px) {
+            body { padding-left: 9px; padding-right: 9px; gap: 7px; }
+            .view-box { padding: 9px; }
+            .history-entry, .library-entry { gap: 6px; padding: 7px; }
+            .history-entry button, .library-entry button { padding-left: 9px; padding-right: 9px; }
+        }
+        @media (max-height: 520px) and (orientation: landscape) {
+            body { gap: 5px; padding-top: max(5px, env(safe-area-inset-top)); }
+            .header { min-height: 32px; }
+            .tabs .tab-btn { min-height: 44px; padding-top: 6px; padding-bottom: 6px; }
+            .player-card { gap: 5px; padding: 7px 10px; border-radius: 14px; }
+            .controls-row { gap: 12px; }
+            .icon-btn { min-height: 44px; }
+            .play-btn { width: 46px; height: 46px; }
+            .settings-row { gap: 6px; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
         }
     </style>
 </head>
@@ -176,43 +242,43 @@ HTML_PAGE = """
     <div class="header">
         <div class="logo"><span>ılılı</span> AudioReader AI</div>
         <div class="header-actions">
-            <label class="btn-tonal" for="fileInput">📂 Wgraj plik</label>
-            <input type="file" id="fileInput" accept=".txt,.pdf,.docx" style="display:none">
-            <button class="btn-tonal" onclick="document.body.classList.toggle('light')">☀️/🌙</button>
+            <button class="settings-btn" id="settingsToggle" aria-label="Ustawienia" aria-expanded="false" onclick="window.toggleSettings()">⚙</button>
         </div>
+        <section class="settings-panel" id="settingsPanel" aria-label="Ustawienia aplikacji" hidden>
+            <button id="themeToggle" onclick="document.body.classList.toggle('light'); window.saveThemePreference()">☀️ / 🌙 Zmień motyw</button>
+            <p>Motyw i dokumenty są zapisywane lokalnie w tej przeglądarce.</p>
+        </section>
     </div>
 
-    <div class="tabs">
-        <button class="tab-btn active" id="tabReader" onclick="window.switchTab('reader')">🎧 Lektor</button>
-        <button class="tab-btn" id="tabEditor" onclick="window.switchTab('editor')">📝 Wklej tekst</button>
+    <input type="file" id="fileInput" accept=".txt,.pdf,.docx" hidden>
+    <nav class="tabs" aria-label="Główna nawigacja">
+        <button class="tab-btn active" id="tabReader" aria-current="page" onclick="window.switchTab('reader')">🎧 Lektor</button>
         <button class="tab-btn" id="tabHistory" onclick="window.switchTab('history')">📅 Historia</button>
-    </div>
+    </nav>
 
-    <section class="resume-panel" id="resumePanel" aria-live="polite">
-        <div class="resume-copy">
-            <span class="resume-title" id="resumeTitle">Zapis lokalny</span>
-            <span class="resume-name" id="resumeName">Sprawdzanie zapamiętanego dokumentu…</span>
-            <span class="resume-note" id="resumeNote">Tekst jest zapamiętywany lokalnie w tej przeglądarce. Chrome i Edge nie współdzielą zapisu.</span>
+    <main class="app-views">
+      <section class="view-box" id="readerView" aria-label="Lektor">
+        <div class="reader-toolbar">
+            <div class="doc-title" id="documentTitle" hidden title=""></div>
+            <div class="reader-actions">
+                <div class="resume-panel" id="resumePanel" aria-live="polite" hidden>
+                    <span class="resume-copy"><span class="resume-title" id="resumeTitle">Zapis lokalny</span><span class="resume-name" id="resumeName"></span><span class="resume-note" id="resumeNote">Tekst jest zapamiętywany lokalnie w tej przeglądarce. Chrome i Edge nie współdzielą zapisu.</span></span>
+                    <div class="resume-actions"><button class="primary" id="resumeContinue" onclick="window.continueSavedDocument()" hidden>Kontynuuj</button><span class="resume-status" id="resumeDelete" hidden></span></div>
+                </div>
+                <button class="add-content-btn" id="addContentButton" onclick="window.openAddContentDialog()">＋ Dodaj treść</button>
+            </div>
         </div>
-        <div class="resume-actions">
-            <button class="primary" id="resumeContinue" onclick="window.continueSavedDocument()" hidden>Kontynuuj od tego miejsca</button>
-            <button id="resumeDelete" onclick="window.deleteSavedDocument()" hidden>Usuń zapamiętany dokument</button>
+        <div class="reader-scroll" id="readerScroll">
+          <div class="reader-empty" id="readerEmpty">
+              <span>Dodaj dokument lub wklej tekst, aby rozpocząć słuchanie.</span>
+          </div>
+          <div id="sentenceList"></div>
         </div>
-    </section>
+      </section>
 
-    <div class="view-box" id="readerView">
-        <div style="color:var(--text-muted); text-align:center; margin:auto;">
-            Wczytaj plik PDF, DOCX lub TXT przyciskiem u góry lub wklej tekst w drugiej zakładce.
-        </div>
-    </div>
-
-    <div class="view-box" id="editorView" style="display:none;">
-        <textarea id="rawText" placeholder="Wklej tutaj dowolny tekst do przeczytania..."></textarea>
-        <button class="apply-btn" onclick="window.applyText()">✔️ Zatwierdź tekst</button>
-    </div>
-
-    <div class="view-box" id="historyView" style="display:none;">
-        <div class="history-toolbar"><strong>Historia odsłuchów</strong><button id="libraryToggle" onclick="window.toggleLibraryView()">📚 Biblioteka</button></div>
+      <section class="view-box" id="historyView" aria-label="Historia odsłuchów" style="display:none;">
+        <div class="history-toolbar"><strong id="historyHeading">Historia odsłuchów</strong><div class="history-subnav" role="tablist" aria-label="Widok historii"><button id="calendarToggle" class="active" role="tab" aria-selected="true" onclick="window.toggleLibraryView(false)">Kalendarz</button><button id="libraryToggle" role="tab" aria-selected="false" onclick="window.toggleLibraryView(true)">Dokumenty</button></div></div>
+        <div class="history-scroll" id="historyScroll">
         <div id="calendarView">
             <div class="history-nav"><button id="historyPrev" aria-label="Poprzedni miesiąc">‹</button><strong id="historyMonth"></strong><button id="historyNext" aria-label="Następny miesiąc">›</button></div>
             <div class="history-grid" id="historyGrid"></div>
@@ -220,6 +286,26 @@ HTML_PAGE = """
         </div>
         <div class="library-list" id="libraryList" hidden></div>
         <small class="resume-note">Biblioteka mieści do 10 dokumentów. Historia obejmuje rzeczywiste sesje odtwarzania w tej przeglądarce.</small>
+        </div>
+      </section>
+    </main>
+
+    <dialog class="add-content-dialog" id="addContentDialog" aria-labelledby="addContentTitle">
+        <div class="sheet-content">
+            <div class="sheet-heading"><h2 id="addContentTitle">Dodaj treść</h2><button class="sheet-close" aria-label="Zamknij" onclick="window.closeAddContentDialog()">×</button></div>
+            <div class="import-options"><button id="chooseFileImport" onclick="window.chooseFileImport()">📂 Wybierz PDF, DOCX lub TXT</button><button id="chooseTextImport" onclick="window.showTextImport()">📝 Wklej tekst</button></div>
+            <form class="text-import-form" id="textImportForm" hidden onsubmit="event.preventDefault(); window.applyText()">
+                <label for="rawText">Tekst do przeczytania</label>
+                <textarea id="rawText" placeholder="Wklej tutaj dowolny tekst do przeczytania..."></textarea>
+                <button class="apply-btn" type="submit">✔️ Czytaj tekst</button>
+            </form>
+            <div class="import-status" id="importStatus" role="status" aria-live="polite"></div>
+        </div>
+    </dialog>
+
+    <div class="mini-player" id="miniPlayer" hidden>
+        <div class="mini-player-main" role="button" tabindex="0" aria-label="Wróć do lektora" onclick="window.switchTab('reader')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.switchTab('reader')}"><span class="mini-player-title" id="miniPlayerTitle"></span><span class="mini-player-status" id="miniPlayerStatus">Gotowy</span></div>
+        <button id="miniPlayBtn" aria-label="Odtwórz lub wstrzymaj" onclick="window.togglePlay()">▶</button>
     </div>
 
     <div class="player-card">
@@ -292,18 +378,106 @@ HTML_PAGE = """
     let activeTab = 'reader';
     let historyDocuments = [];
     let historySessions = [];
+    let dialogReturnFocus = null;
+
+    window.toggleSettings = function(force) {
+        const panel = document.getElementById('settingsPanel');
+        const button = document.getElementById('settingsToggle');
+        const open = typeof force === 'boolean' ? force : panel.hidden;
+        panel.hidden = !open;
+        button.setAttribute?.('aria-expanded', String(open));
+    };
+
+    window.saveThemePreference = function() {
+        try { localStorage.setItem('audioReaderTheme', document.body.classList.contains('light') ? 'light' : 'dark'); } catch {}
+    };
+
+    try { if (localStorage.getItem('audioReaderTheme') === 'light') document.body.classList.add('light'); } catch {}
+
+    function setImportStatus(message) {
+        const status = document.getElementById('importStatus');
+        if (status) status.textContent = message;
+    }
+
+    window.openAddContentDialog = function() {
+        const dialog = document.getElementById('addContentDialog');
+        dialogReturnFocus = document.activeElement;
+        document.getElementById('textImportForm').hidden = true;
+        setImportStatus('');
+        document.body.classList.add('modal-open');
+        dialog.hidden = false;
+        if (typeof dialog.showModal === 'function') { if (!dialog.open) dialog.showModal(); }
+        else { dialog.open = true; dialog.hidden = false; }
+        document.getElementById('chooseFileImport').focus?.();
+    };
+
+    window.closeAddContentDialog = function() {
+        const dialog = document.getElementById('addContentDialog');
+        const nativeDialog = typeof dialog.showModal === 'function' && typeof dialog.close === 'function';
+        if (nativeDialog) { if (dialog.open) dialog.close(); }
+        else { dialog.open = false; dialog.hidden = true; }
+        document.body.classList.remove('modal-open', 'keyboard-open');
+        dialogReturnFocus?.focus?.();
+    };
+
+    window.showTextImport = function() {
+        document.getElementById('textImportForm').hidden = false;
+        document.getElementById('rawText').focus?.();
+    };
+
+    window.chooseFileImport = function() {
+        window.closeAddContentDialog();
+        document.getElementById('fileInput').click();
+    };
+
+    document.getElementById('addContentDialog').addEventListener('click', event => {
+        if (event.target === document.getElementById('addContentDialog')) window.closeAddContentDialog();
+    });
+    document.getElementById('addContentDialog').addEventListener('close', () => {
+        document.body.classList.remove('modal-open', 'keyboard-open');
+        dialogReturnFocus?.focus?.();
+    });
+    document.getElementById('addContentDialog').addEventListener('cancel', () => {
+        document.body.classList.remove('modal-open', 'keyboard-open');
+        dialogReturnFocus?.focus?.();
+    });
+    document.getElementById('rawText').addEventListener('focus', () => document.body.classList.add('keyboard-open'));
+    document.getElementById('rawText').addEventListener('blur', () => document.body.classList.remove('keyboard-open'));
+    if (typeof document.addEventListener === 'function') document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') window.toggleSettings(false);
+    });
+
+    function updateMiniPlayer() {
+        const mini = document.getElementById('miniPlayer');
+        const title = document.getElementById('miniPlayerTitle');
+        const play = document.getElementById('miniPlayBtn');
+        if (!mini) return;
+        mini.hidden = !currentDocument || activeTab !== 'history';
+        title.textContent = currentDocument?.name || '';
+        title.title = currentDocument?.name || '';
+        play.textContent = isReading && !isPaused ? '⏸' : '▶';
+        play.setAttribute?.('aria-label', isReading && !isPaused ? 'Wstrzymaj odtwarzanie' : 'Wznów odtwarzanie');
+        document.getElementById('miniPlayerStatus').textContent = document.getElementById('statusText').innerText || 'Gotowy';
+    }
+    updateMiniPlayer();
 
     function resumeMessage(title, detail, record = null) {
         const panel = document.getElementById('resumePanel');
         if (!panel) return;
-        panel.hidden = false;
+        const saveWarning = /nie udało|nie został zapisany|niedostępny|błąd/i.test(title);
+        panel.hidden = !record && !saveWarning;
         document.getElementById('resumeTitle').textContent = title;
         document.getElementById('resumeName').textContent = detail;
         document.getElementById('resumeNote').textContent = 'Tekst jest zapamiętywany lokalnie w tej przeglądarce. Chrome i Edge nie współdzielą zapisu.';
         document.getElementById('resumeContinue').hidden = !record;
-        document.getElementById('resumeDelete').hidden = !record;
-        if (record) document.getElementById('resumeContinue').textContent = record.completed
-            ? 'Czytaj od początku' : 'Kontynuuj od tego miejsca';
+        const compactStatus = document.getElementById('resumeDelete');
+        compactStatus.hidden = !!record || !saveWarning;
+        compactStatus.textContent = compactStatus.hidden ? '' : detail;
+        if (record) {
+            const button=document.getElementById('resumeContinue');
+            button.textContent = record.completed ? 'Od początku' : 'Kontynuuj';
+            button.setAttribute?.('aria-label', record.completed ? 'Czytaj ukończony dokument od początku' : 'Kontynuuj czytanie od zapisanego miejsca');
+        }
     }
 
     function openResumeDatabase() {
@@ -522,10 +696,20 @@ HTML_PAGE = """
         if (!entries.length) { const empty=document.createElement('div'); empty.className='history-empty'; empty.innerText='Brak sesji odsłuchu tego dnia.'; list.appendChild(empty); return; }
         entries.forEach(item=>{
             const row=document.createElement('div'); row.className='history-entry';
-            const copy=document.createElement('div');
+            const copy=document.createElement('div'); copy.className='history-entry-copy';
             const time=new Intl.DateTimeFormat('pl-PL',{hour:'2-digit',minute:'2-digit'}).format(new Date(item.startedAt));
             const statusLabels={playing:'Odtwarzanie',paused:'Wstrzymana',stopped:'Zatrzymana',completed:'Ukończona',interrupted:'Przerwana'};
-            copy.innerText=`${time} • ${item.documentName || historyDocuments.find(d=>d.id===item.documentId)?.name || 'Dokument usunięty'}${item.voice ? ' • '+item.voice.replace('pl-PL-','') : ''} • ${statusLabels[item.status] || item.status}`;
+            const name=item.documentName || historyDocuments.find(d=>d.id===item.documentId)?.name || 'Dokument usunięty';
+            const title=document.createElement('strong'); title.className='history-entry-title'; title.innerText=name; title.title=name; copy.appendChild(title);
+            const voiceLabels={'pl-PL-MarekNeural':'Marek','pl-PL-ZofiaNeural':'Zofia'};
+            const details=[`Start: ${time}`, voiceLabels[item.voice] || (item.voice ? item.voice.replace('pl-PL-','') : ''), statusLabels[item.status] || item.status];
+            if (Boolean(item.endedAt) && Number.isFinite(item.endedAt) && item.endedAt >= item.startedAt)
+                details.splice(1, 0, `Koniec: ${new Intl.DateTimeFormat('pl-PL',{hour:'2-digit',minute:'2-digit'}).format(new Date(item.endedAt))}`);
+            if (Number.isFinite(item.playedMs) && item.playedMs > 0) {
+                const seconds=Math.floor(item.playedMs/1000), duration=`${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`;
+                details.push(`Czas: ${duration}`);
+            }
+            const meta=document.createElement('span'); meta.className='history-entry-meta'; meta.innerText=details.filter(Boolean).join(' • '); copy.appendChild(meta);
             row.appendChild(copy);
             const doc=historyDocuments.find(d=>d.id===item.documentId);
             if (doc) { const button=document.createElement('button'); button.innerText=doc.completed?'Powtórz':'Otwórz'; button.onclick=()=>openLibraryDocument(doc.id); row.appendChild(button); }
@@ -539,10 +723,12 @@ HTML_PAGE = """
         if (!historyDocuments.length) { const empty=document.createElement('div'); empty.className='history-empty'; empty.innerText='Biblioteka jest pusta. Wklej tekst lub wgraj dokument.'; list.appendChild(empty); return; }
         historyDocuments.forEach(record=>{
             const row=document.createElement('div'); row.className='library-entry';
-            const copy=document.createElement('div'); copy.innerText=`${record.name} • ${record.completed?'Ukończony':`zdanie ${Math.min(record.index+1,record.sentenceCount)} z ${record.sentenceCount}`}`;
+            const copy=document.createElement('div'); copy.className='library-entry-copy';
+            const title=document.createElement('strong'); title.className='library-entry-title'; title.innerText=record.name; title.title=record.name; copy.appendChild(title);
+            const meta=document.createElement('span'); meta.className='library-entry-meta'; meta.innerText=record.completed?'Ukończony':`zdanie ${Math.min(record.index+1,record.sentenceCount)} z ${record.sentenceCount}`; copy.appendChild(meta);
             row.appendChild(copy);
             const open=document.createElement('button'); open.innerText='Otwórz'; open.onclick=()=>openLibraryDocument(record.id); row.appendChild(open);
-            const remove=document.createElement('button'); remove.innerText='Usuń'; remove.setAttribute?.('aria-label',`Usuń ${record.name}`); remove.onclick=()=>deleteLibraryDocument(record.id); row.appendChild(remove);
+            const remove=document.createElement('button'); remove.innerText='Usuń'; remove.setAttribute?.('aria-label',`Usuń ${record.name}`); remove.onclick=()=>{ if (typeof window.confirm !== 'function' || window.confirm(`Usunąć „${record.name}” wraz z historią?`)) deleteLibraryDocument(record.id); }; row.appendChild(remove);
             list.appendChild(row);
         });
     }
@@ -588,7 +774,10 @@ HTML_PAGE = """
             if (wasCurrent && currentDocument?.id===id && resumeDocumentRevision===deletionRevision) {
                 currentDocument=null;
                 sentences=[];
-                document.getElementById('readerView').innerHTML='';
+                document.getElementById('sentenceList').innerHTML='';
+                document.getElementById('readerEmpty').hidden=false;
+                document.getElementById('documentTitle').hidden=true;
+                updateMiniPlayer();
                 resumeMessage('Dokument usunięty','Treść, postęp i historia dokumentu zostały usunięte z tej przeglądarki.');
             }
             await renderLibrary();
@@ -596,11 +785,14 @@ HTML_PAGE = """
         return resumeWriteQueue;
     }
 
-    window.toggleLibraryView = function() {
-        showingLibrary=!showingLibrary;
+    window.toggleLibraryView = function(showLibrary) {
+        showingLibrary=typeof showLibrary==='boolean'?showLibrary:!showingLibrary;
         document.getElementById('calendarView').hidden=showingLibrary;
         document.getElementById('libraryList').hidden=!showingLibrary;
-        document.getElementById('libraryToggle').textContent=showingLibrary?'📅 Kalendarz':'📚 Biblioteka';
+        document.getElementById('calendarToggle').classList.toggle('active',!showingLibrary);
+        document.getElementById('calendarToggle').setAttribute?.('aria-selected',String(!showingLibrary));
+        document.getElementById('libraryToggle').classList.toggle('active',showingLibrary);
+        document.getElementById('libraryToggle').setAttribute?.('aria-selected',String(showingLibrary));
         if (showingLibrary) renderLibrary(); else refreshHistory();
     };
 
@@ -987,21 +1179,29 @@ HTML_PAGE = """
     }
 
     window.switchTab = function(tab) {
+        if (tab === 'editor') { window.openAddContentDialog(); window.showTextImport(); return; }
+        tab = tab === 'history' ? 'history' : 'reader';
         activeTab = tab;
         document.getElementById('readerView').style.display = tab === 'reader' ? 'flex' : 'none';
-        document.getElementById('editorView').style.display = tab === 'editor' ? 'flex' : 'none';
         document.getElementById('historyView').style.display = tab === 'history' ? 'flex' : 'none';
         document.getElementById('tabReader').classList.toggle('active', tab === 'reader');
-        document.getElementById('tabEditor').classList.toggle('active', tab === 'editor');
         document.getElementById('tabHistory').classList.toggle('active', tab === 'history');
-        if (tab === 'history') refreshHistory();
+        document.getElementById('tabReader').setAttribute?.('aria-current', tab === 'reader' ? 'page' : 'false');
+        document.getElementById('tabHistory').setAttribute?.('aria-current', tab === 'history' ? 'page' : 'false');
+        document.body.classList.toggle('history-active', tab === 'history');
+        if (tab === 'history') {
+            if (showingLibrary) renderLibrary(); else refreshHistory();
+        }
+        updateMiniPlayer();
     };
 
     window.applyText = function() {
         const text = document.getElementById('rawText').value.trim();
-        if (!text) return setStatus('Wklej tekst przed zatwierdzeniem.');
+        if (!text) { setImportStatus('Wklej tekst przed zatwierdzeniem.'); return setStatus('Wklej tekst przed zatwierdzeniem.'); }
         resumeUserAction++;
         renderSentences(text, [], {name: 'Wklejony tekst'});
+        setImportStatus('Tekst gotowy do czytania.');
+        window.closeAddContentDialog();
         window.switchTab('reader');
     };
 
@@ -1012,13 +1212,21 @@ HTML_PAGE = """
         resumeSavingEnabled = true;
         lastProgressSavedIndex = null;
         lastProgressSaveAt = 0;
-        const box = document.getElementById('readerView');
+        const box = document.getElementById('sentenceList');
         box.innerHTML = '';
         const segments = speechSegments(text, hints);
         sentences = segments.map(segment => segment.text);
         const blocks = safeResumeBlocks(hints, text.length);
+        resumeStoredRecord = options.restored ? resumeStoredRecord : null;
         currentDocument = {id: options.id || makeDocumentId(), createdAt: options.createdAt || Date.now(), lastUsedAt: options.lastUsedAt || 0,
             text, name: options.name || 'Dokument', blocks: blocks || [], completed: !!options.completed};
+        const title = document.getElementById('documentTitle');
+        title.textContent = currentDocument.name;
+        title.title = currentDocument.name;
+        title.hidden = false;
+        document.getElementById('readerEmpty').hidden = sentences.length > 0;
+        resumeMessage('Zapamiętany dokument', currentDocument.name, resumeStoredRecord);
+        updateMiniPlayer();
 
         sentences.forEach((s, idx) => {
             const div = document.createElement('div');
@@ -1043,6 +1251,7 @@ HTML_PAGE = """
     document.getElementById('fileInput').addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
+        e.target.value = '';
         const importAction=++resumeUserAction;
         const importRevision=resumeDocumentRevision;
         setStatus(`⏳ Wysyłanie pliku (${file.name})...`);
@@ -1059,11 +1268,13 @@ HTML_PAGE = """
             document.getElementById('rawText').value = data.text;
             if (typeof data.text !== 'string' || !data.text.trim()) throw new Error('Plik nie zawiera tekstu do czytania.');
             renderSentences(data.text, data.blocks || [], {name: file.name});
+            window.closeAddContentDialog();
             window.switchTab('reader');
             setStatus(`✔️ Wczytano plik: ${file.name}`);
         } catch (err) {
             if (importAction !== resumeUserAction || importRevision !== resumeDocumentRevision) return;
-            alert('Błąd wczytywania pliku: ' + err.message);
+            window.openAddContentDialog();
+            setImportStatus('Nie udało się wczytać pliku: ' + err.message);
             setStatus('❌ Błąd odczytu pliku');
             if (!currentDocument) restoreSavedDocument();
         }
@@ -1501,7 +1712,7 @@ HTML_PAGE = """
         const activeEl = document.getElementById('sent-' + idx);
         if (activeEl) {
             activeEl.classList.add('active');
-            activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
+            if (activeTab === 'reader') activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
         }
         document.getElementById('progressBar').style.width = (((idx + 1) / sentences.length) * 100) + '%';
         if (!isPaused) setStatus(`Czytanie zdania ${idx + 1} z ${sentences.length}`);
@@ -1846,7 +2057,7 @@ HTML_PAGE = """
         const activeEl = document.getElementById('sent-' + idx);
         if (activeEl) {
             activeEl.classList.add('active');
-            activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
+            if (activeTab === 'reader') activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
         }
         document.getElementById('progressBar').style.width = (((idx + 1) / sentences.length) * 100) + '%';
         setStatus(`Generowanie AI (${idx + 1}/${sentences.length})...`);
@@ -1914,7 +2125,7 @@ HTML_PAGE = """
         const activeEl = document.getElementById('sent-' + idx);
         if (activeEl) {
             activeEl.classList.add('active');
-            activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
+            if (activeTab === 'reader') activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
         }
         document.getElementById('progressBar').style.width = (((idx + 1) / sentences.length) * 100) + '%';
         setStatus(`Czytanie zdania ${idx + 1} z ${sentences.length}`);
@@ -2080,6 +2291,7 @@ HTML_PAGE = """
 
     function setStatus(msg) {
         document.getElementById('statusText').innerText = msg;
+        updateMiniPlayer();
     }
 </script>
 </body>
