@@ -190,6 +190,8 @@ HTML_PAGE = """
     let controller = new AbortController();
     let ready = false;
     let loading = false;
+    let activePlayback = null;
+    const mediaSession = typeof navigator !== 'undefined' && navigator.mediaSession ? navigator.mediaSession : null;
     let ttsNotBefore = 0;
     let ttsAttempt = 1;
 
@@ -429,7 +431,95 @@ HTML_PAGE = """
     let transition = null;
     const diagnostics = testMode ? {started: performance.now(), events: [], dropped: 0,
         gaps: [], droppedGaps: 0, failed: 0, cancelled: 0, hits: 0, misses: 0,
-        observedPlayers: new WeakSet(), progressAt: new WeakMap(), visibleProbe: 0, visibleTimer: null} : null;
+        recoveryAttempts: 0, observedPlayers: new WeakSet(), progressAt: new WeakMap(), visibleProbe: 0, visibleTimer: null} : null;
+
+    function setMediaPlaybackState(state) {
+        if (!mediaSession || !('playbackState' in mediaSession)) return;
+        try { mediaSession.playbackState = state; } catch {}
+    }
+
+    function registerMediaSessionActions() {
+        if (!mediaSession || typeof mediaSession.setActionHandler !== 'function') return;
+        try {
+            if (typeof MediaMetadata === 'function') {
+                mediaSession.metadata = new MediaMetadata({title: 'AudioReader AI', artist: 'Odtwarzanie tekstu'});
+            }
+        } catch {}
+        const actions = {
+            play: () => { if (!isReading || isPaused) window.togglePlay(); },
+            pause: () => { if (isReading && !isPaused) window.togglePlay(); },
+            stop: () => { if (isReading) window.stopReading(); }
+        };
+        for (const [action, handler] of Object.entries(actions)) {
+            try { mediaSession.setActionHandler(action, handler); } catch {}
+        }
+    }
+
+    function handleUnexpectedPause(player) {
+        const playback = activePlayback;
+        if (!playback || playback.player !== player || playback.token !== session ||
+            playback.idx !== currentIdx || playback.ended || player.ended || !player.paused) return;
+        setMediaPlaybackState('paused');
+        if (isPaused) return;
+        const age = performance.now() - playback.startedAt;
+        const currentTime = Number(player.currentTime);
+        // Recover only the short startup interruption seen in MOB-04A. Later pauses
+        // are ambiguous and stay paused for the user to resume explicitly.
+        const eligible = isReading && playback.startedAt !== null && age >= 0 && age <= 500 &&
+            Number.isFinite(currentTime) && currentTime <= 0.5 &&
+            (document.visibilityState || 'unknown') === 'hidden';
+        if (!eligible || playback.recoveryTried) {
+            isPaused = true;
+            document.getElementById('playBtn').innerText = '▶';
+            setStatus('Odtwarzanie zostało wstrzymane. Naciśnij ▶, aby wznowić.');
+            trace('recovery_result', {fragment: playback.idx, result: 'left_paused', reason: playback.recoveryTried ? 'retry_used' : 'outside_recovery_window'});
+            return;
+        }
+        playback.recoveryTried = true;
+        trace('recovery_scheduled', {fragment: playback.idx, playback_age_ms: age, current_time: currentTime});
+        setTimeout(async () => {
+            if (activePlayback !== playback || playback.token !== session || playback.idx !== currentIdx ||
+                player !== audio || !isReading || isPaused ||
+                (document.visibilityState || 'unknown') !== 'hidden' || !player.paused || player.ended) {
+                const samePlayback = activePlayback === playback && playback.token === session && playback.idx === currentIdx && player === audio;
+                if (samePlayback && isReading && !isPaused && player.paused) {
+                    isPaused = true;
+                    setMediaPlaybackState('paused');
+                    document.getElementById('playBtn').innerText = '▶';
+                    setStatus('Odtwarzanie zostało wstrzymane. Naciśnij ▶, aby wznowić.');
+                }
+                trace('recovery_cancelled', {fragment: playback.idx, same_playback: samePlayback});
+                return;
+            }
+            if (diagnostics) diagnostics.recoveryAttempts++;
+            trace('recovery_attempt', {fragment: playback.idx, current_time: Number.isFinite(player.currentTime) ? player.currentTime : null});
+            try {
+                await player.play();
+                if (activePlayback === playback && playback.token === session && playback.idx === currentIdx &&
+                    player === audio && isReading && !isPaused) {
+                    setMediaPlaybackState('playing');
+                    trace('recovery_result', {fragment: playback.idx, result: 'play_resolved'});
+                }
+            } catch (error) {
+                if (activePlayback !== playback || playback.token !== session || playback.idx !== currentIdx || player !== audio) return;
+                isPaused = true;
+                setMediaPlaybackState('paused');
+                document.getElementById('playBtn').innerText = '▶';
+                setStatus('Odtwarzanie zostało wstrzymane. Naciśnij ▶, aby wznowić.');
+                trace('recovery_result', {fragment: playback.idx, result: 'play_rejected', error_name: error?.name || 'Error'});
+            }
+        }, 150);
+    }
+
+    function observePlaybackPause(player) {
+        if (typeof player.addEventListener !== 'function') return;
+        player.addEventListener('pause', () => {
+            handleUnexpectedPause(player);
+            if (diagnostics) trace('media_event', {media_event: 'pause', player: playerSnapshot(player)});
+        });
+    }
+
+    observePlaybackPause(audio);
 
     function playerSnapshot(player = audio) {
         const numberOrNull = value => Number.isFinite(value) ? value : null;
@@ -452,7 +542,7 @@ HTML_PAGE = """
     function observePlayer(player) {
         if (!diagnostics || diagnostics.observedPlayers.has(player)) return;
         diagnostics.observedPlayers.add(player);
-        for (const type of ['pause', 'playing', 'waiting', 'stalled', 'suspend', 'ended', 'error']) {
+        for (const type of ['playing', 'waiting', 'stalled', 'suspend', 'ended', 'error']) {
             player.addEventListener(type, () => trace('media_event', {media_event: type,
                 player: playerSnapshot(player)}));
         }
@@ -501,6 +591,7 @@ HTML_PAGE = """
             failed_transitions: diagnostics.failed, cancelled_transitions: diagnostics.cancelled,
             pending_transition: transition ? {from: transition.from, to: transition.to, elapsed_ms: performance.now() - transition.ended} : null,
             buffer_hits: diagnostics.hits, buffer_misses: diagnostics.misses,
+            recovery_attempts: diagnostics.recoveryAttempts,
             dropped_events: diagnostics.dropped, dropped_gap_samples: diagnostics.droppedGaps,
             cache: {fragments: prefetchCache.size, bytes: cacheBytes()},
             note: 'Hidden nie potwierdza blokady ekranu. media_event zawiera stan odtwarzacza i currentTime. Po powrocie do widocznej strony wykonywany jest punkt kontrolny po 5 s; playback_advanced oznacza zmianę currentTime ponad 0,05 s. Przerwy ended/playing mierzą callbacki. Rejestrowanych jest maksymalnie 2000 zdarzeń.',
@@ -744,6 +835,7 @@ HTML_PAGE = """
         const idx = currentIdx;
         setStatus(`Czytanie zdania ${currentIdx + 1} z ${sentences.length}`);
         trace("play_call");
+        setMediaPlaybackState('playing');
         try {
             await audio.play();
             if (token === session && currentIdx === idx && isReading && !isPaused) fillBuffer();
@@ -787,8 +879,12 @@ HTML_PAGE = """
             attachedKey = [...prefetchCache.values()].find(job => job.url === audioUrl)?.key || null;
             trimCache();
             let started = false;
+            activePlayback = {token, idx, player, startedAt: null, recoveryTried: false, ended: false};
             player.onplaying = () => {
                 if (token !== session || currentIdx !== idx) return;
+                if (activePlayback?.token === token && activePlayback.idx === idx && activePlayback.player === player && activePlayback.startedAt === null) {
+                    activePlayback.startedAt = performance.now();
+                }
                 trace('playing');
                 if (!started) { started = true; finishTransition('playing'); }
             };
@@ -798,10 +894,9 @@ HTML_PAGE = """
             player.onended = () => {
                 if (token !== session || !isReading || currentIdx !== idx) return;
                 const endedAt = performance.now();
+                if (activePlayback?.token === token && activePlayback.idx === idx && activePlayback.player === player) activePlayback.ended = true;
                 player.onended = null;
                 trace('ended');
-                player.removeAttribute('src');
-                player.load();
                 attachedKey = null;
                 ready = false;
                 if (idx + 1 < sentences.length && !isPaused) transition = {ended: endedAt, from: idx, to: idx + 1,
@@ -822,6 +917,7 @@ HTML_PAGE = """
         window.stopReading();
         currentIdx = idx;
         isReading = true;
+        setMediaPlaybackState('playing');
         document.getElementById('playBtn').innerText = '⏸';
         playCurrent();
     };
@@ -837,11 +933,13 @@ HTML_PAGE = """
             isPaused = true;
             finishTransition("cancelled");
             trace("pause");
+            setMediaPlaybackState('paused');
             audio.pause();
             document.getElementById('playBtn').innerText = '▶';
             setStatus('Wstrzymano');
         } else {
             isPaused = false;
+            setMediaPlaybackState('playing');
             document.getElementById('playBtn').innerText = '⏸';
             if (ready) playReady(session);
             else if (!loading) playCurrent();
@@ -853,6 +951,7 @@ HTML_PAGE = """
         finishTransition('cancelled');
         trace('stop');
         session++;
+        activePlayback = null;
         controller.abort();
         controller = new AbortController();
         isReading = false;
@@ -867,7 +966,9 @@ HTML_PAGE = """
         audio.pause();
         audio.removeAttribute('src');
         audio.load();
+        setMediaPlaybackState('none');
         audio = new Audio();
+        observePlaybackPause(audio);
         observePlayer(audio);
         attachedKey = null;
         clearAudioCache();
@@ -896,6 +997,8 @@ HTML_PAGE = """
     }
     document.getElementById('voiceSelect').addEventListener('change', settingsChanged);
     document.getElementById('rateSlider').addEventListener('change', settingsChanged);
+
+    registerMediaSessionActions();
 
     if (testMode) {
         document.addEventListener('visibilitychange', () => {

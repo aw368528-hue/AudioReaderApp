@@ -5,7 +5,7 @@ const script = fs.readFileSync(0, 'utf8');
 async function settle() { for (let n = 0; n < 12; n++) await new Promise(r => setTimeout(r, 1)); }
 const ok = () => ({ok: true, blob: async () => ({size: 10})});
 const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
-function harness(fetch, query = '') {
+function harness(fetch, query = '', withMediaSession = true) {
     const elements = new Map();
     function element() {
         return {value: '', style: {}, innerText: '', innerHTML: '', children: [],
@@ -17,14 +17,17 @@ function harness(fetch, query = '') {
     const created = [];
     const body = element();
     const documentListeners = {};
+    const mediaActions = {};
+    const mediaSession = {playbackState: 'none', metadata: null,
+        setActionHandler(action, callback) { mediaActions[action] = callback; }};
     let performanceTime = 0;
     class Audio {
         constructor() { this.plays = 0; this.src = ''; this.paused = true; this.ended = false;
             this.currentTime = 0; this.duration = 12; this.readyState = 4; this.networkState = 1;
             this.playbackRate = 1; this.listeners = {}; audios.push(this); }
-        async play() { this.plays++; }
-        pause() {}
-        load() {}
+        async play() { this.plays++; this.paused = false; }
+        pause() { this.paused = true; this.dispatch('pause'); }
+        load() { this.loads = (this.loads || 0) + 1; }
         removeAttribute() { this.src = ''; }
         addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
         dispatch(type) { for (const callback of this.listeners[type] || []) callback({type}); }
@@ -33,7 +36,8 @@ function harness(fetch, query = '') {
     const delays = [];
     class Clock extends Date { static now() { return now; } }
     const context = vm.createContext({window: {}, location: {search: query}, URLSearchParams, Blob,
-        navigator: {clipboard: {writeText: async text => { context.copied = text; }}},
+        navigator: {clipboard: {writeText: async text => { context.copied = text; }}, ...(withMediaSession ? {mediaSession} : {})},
+        MediaMetadata: class MediaMetadata { constructor(data) { Object.assign(this, data); } },
         performance: {now: () => performanceTime}, document: {body, visibilityState: 'visible',
         addEventListener(type, callback) { documentListeners[type] = callback; },
         getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
@@ -44,7 +48,8 @@ function harness(fetch, query = '') {
     const run = code => vm.runInContext(code, context);
     context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
     context.document.getElementById('rateSlider').value = '0';
-    return {run, context, elements, audios, delays, revoked, created, documentListeners, advance(ms) { performanceTime += ms; }};
+    return {run, context, elements, audios, delays, revoked, created, documentListeners, mediaSession, mediaActions,
+        advance(ms) { performanceTime += ms; }};
 }
 const cases = [];
 function test(name, fn) { cases.push([name, fn]); }
@@ -723,7 +728,7 @@ test('Diagnostyka MOB-04A zapisuje zdarzenia i stan audio bez źródeł audio', 
     h.advance(1); h.run('audio.currentTime=3.5; audio.dispatch("timeupdate")');
     const report = h.run('diagnosticReport()');
     assert.deepEqual(Array.from(report.events.filter(e=>e.type==='media_event'), e=>e.media_event),
-        ['pause','playing','waiting','stalled','suspend','ended','error']);
+        ['pause','pause','playing','waiting','stalled','suspend','ended','error']);
     assert.ok(report.events.some(e=>e.type==='playback_progress' && e.player.current_time===1.25));
     assert.ok(report.events.some(e=>e.type==='playback_progress' && e.player.current_time===3.5));
     assert.ok(report.events.find(e=>e.type==='media_event').player.paused);
@@ -750,8 +755,92 @@ test('Kontrola po powrocie wykrywa brak postępu currentTime', async () => {
 test('Zdarzenia odtwarzacza są wyłączone bez test=1', async () => {
     const h = harness(async()=>ok(), '?test=0');
     assert.equal(h.run('diagnostics'), null);
-    assert.equal(Object.keys(h.audios[0].listeners).length, 0);
+    assert.deepEqual(Object.keys(h.audios[0].listeners), ['pause']);
     assert.equal(h.run('diagnosticReport()'), null);
+});
+test('MOB-05 odzyskuje jedną wczesną pauzę w tle dla fragmentów 2 i 4 z buffer=2', async () => {
+    for (const idx of [2, 4]) {
+        const sentences = Array.from({length: 7}, (_, n) => `Zdanie ${n}.`);
+        const h = harness(async()=>ok(), '?test=1&buffer=2');
+        h.run(`sentences=${JSON.stringify(sentences)}; window.startFrom(${idx})`);
+        await settle();
+        assert.ok(h.run(`prefetchCache.has([...jobs.values()].find(job=>job.idx===${idx + 1})?.key)`));
+        h.context.document.visibilityState = 'hidden';
+        h.run('audio.currentTime=0.071; audio.onplaying()');
+        const player = h.audios.at(-1);
+        h.advance(145);
+        h.run('audio.paused=true; audio.dispatch("pause")');
+        await settle();
+        assert.equal(player.plays, 2, `fragment ${idx} should have one recovery play`);
+        assert.equal(h.run('diagnosticReport().recovery_attempts'), 1);
+        assert.ok(h.run(`diagnosticReport().events.some(event=>event.type==="recovery_attempt" && event.index===${idx})`));
+        h.run('audio.paused=true; audio.dispatch("pause")');
+        await settle();
+        assert.equal(player.plays, 2, 'recovery must not loop');
+    }
+});
+test('MOB-05 respektuje pauzę Media Session i nie wznawia po stopie ani późnej pauzie', async () => {
+    const h = harness(async()=>ok(), '?test=1&buffer=2');
+    h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+    assert.equal(h.mediaSession.playbackState, 'playing');
+    assert.equal(h.mediaSession.metadata.title, 'AudioReader AI');
+    assert.deepEqual(Object.keys(h.mediaActions).sort(), ['pause','play','stop']);
+    h.context.document.visibilityState = 'hidden';
+    h.run('audio.onplaying()'); h.advance(145);
+    h.mediaActions.pause(); await settle();
+    assert.equal(h.run('isPaused'), true);
+    assert.equal(h.mediaSession.playbackState, 'paused');
+    assert.equal(h.audios.at(-1).plays, 1);
+    h.mediaActions.play(); await settle();
+    assert.equal(h.run('isPaused'), false);
+    assert.equal(h.audios.at(-1).plays, 2);
+
+    h.run('window.stopReading()');
+    const stoppedPlayer = h.audios.at(-1);
+    assert.equal(h.mediaSession.playbackState, 'none');
+    h.run('sentences=["New."]; window.startFrom(0)'); await settle();
+    h.context.document.visibilityState = 'hidden'; h.run('audio.onplaying()'); h.advance(800);
+    h.run('audio.paused=true; audio.dispatch("pause")'); await settle();
+    const currentPlayer = h.audios.at(-1);
+    assert.equal(currentPlayer.plays, 1, 'a later pause must remain paused');
+    stoppedPlayer.paused = true; stoppedPlayer.dispatch('pause'); await settle();
+    assert.equal(currentPlayer.plays, 1, 'a stale player from the stopped session must not resume');
+});
+test('MOB-05 anuluje oczekującą próbę po zmianie dokumentu i nie odzyskuje pauzy widocznej karty', async () => {
+    const h = harness(async()=>ok(), '?test=1&buffer=0');
+    h.run('sentences=["A."]; window.startFrom(0)'); await settle();
+    const player = h.audios.at(-1);
+    h.context.document.visibilityState = 'hidden';
+    h.run('audio.onplaying()'); h.advance(145);
+    h.run('audio.paused=true; audio.dispatch("pause"); renderSentences("Nowy dokument.")');
+    await settle();
+    assert.equal(player.plays, 1, 'document/session change must invalidate the timer');
+
+    h.run('window.startFrom(0)'); await settle();
+    const visiblePlayer = h.audios.at(-1);
+    h.context.document.visibilityState = 'visible';
+    h.run('audio.onplaying()'); h.advance(145);
+    h.run('audio.paused=true; audio.dispatch("pause")'); await settle();
+    assert.equal(visiblePlayer.plays, 1, 'visible pauses stay paused');
+    assert.equal(h.run('isPaused'), true);
+});
+test('MOB-05 Media Session API jest opcjonalne', async () => {
+    const h = harness(async()=>ok(), '', false);
+    h.run('sentences=["A."]; window.startFrom(0)'); await settle();
+    assert.equal(h.run('mediaSession'), null);
+    assert.equal(h.audios.at(-1).plays, 1);
+});
+test('Przejście fragmentu nie resetuje elementu audio ani nie narusza zwalniania cache', async () => {
+    const h = harness(async()=>ok(), '?buffer=2');
+    h.run('sentences=["A.","B.","C."]; window.startFrom(0)'); await settle();
+    const player = h.audios.at(-1);
+    const firstUrl = player.src;
+    const loadsBeforeEnd = player.loads;
+    h.run('audio.onended()'); await settle();
+    assert.equal(player.loads, loadsBeforeEnd);
+    assert.notEqual(player.src, firstUrl);
+    assert.ok(h.revoked.includes(firstUrl), 'completed fragment URL should be released');
+    assert.ok(h.run('prefetchCache.has([...jobs.values()].find(job=>job.idx===1)?.key)'), 'next cached fragment remains attached');
 });
 test('Przełącznik bufora i zmiana dokumentu czyszczą poprzednią sesję', async () => {
     const h=harness(async()=>ok(), '?test=1&buffer=2');
