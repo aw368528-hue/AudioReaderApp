@@ -191,6 +191,10 @@ HTML_PAGE = """
     let ready = false;
     let loading = false;
     let activePlayback = null;
+    let continuousPlayback = null;
+    const STREAM_MIME = 'audio/mpeg';
+    const STREAM_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
+    const STREAM_RETAIN_SECONDS = 30;
     const mediaSession = typeof navigator !== 'undefined' && navigator.mediaSession ? navigator.mediaSession : null;
     let ttsNotBefore = 0;
     let ttsAttempt = 1;
@@ -431,7 +435,9 @@ HTML_PAGE = """
     let transition = null;
     const diagnostics = testMode ? {started: performance.now(), events: [], dropped: 0,
         gaps: [], droppedGaps: 0, failed: 0, cancelled: 0, hits: 0, misses: 0,
-        recoveryAttempts: 0, observedPlayers: new WeakSet(), progressAt: new WeakMap(), visibleProbe: 0, visibleTimer: null} : null;
+        recoveryAttempts: 0, stream: {mode: 'not_checked', is_type_supported: null, appended_bytes: 0,
+            buffered_bytes: 0, buffered_seconds: 0, last_error: null},
+        observedPlayers: new WeakSet(), progressAt: new WeakMap(), visibleProbe: 0, visibleTimer: null} : null;
 
     function setMediaPlaybackState(state) {
         if (!mediaSession || !('playbackState' in mediaSession)) return;
@@ -456,6 +462,16 @@ HTML_PAGE = """
     }
 
     function handleUnexpectedPause(player) {
+        if (continuousPlayback && continuousPlayback.player === player && continuousPlayback.token === session) {
+            setMediaPlaybackState('paused');
+            if (isReading && !isPaused && !player.ended) {
+                isPaused = true;
+                document.getElementById('playBtn').innerText = '▶';
+                setStatus('Odtwarzanie zostało wstrzymane. Naciśnij ▶, aby wznowić.');
+                trace('stream_pause', {stream_index: continuousPlayback.currentIndex, current_time: Number.isFinite(player.currentTime) ? player.currentTime : null});
+            }
+            return;
+        }
         const playback = activePlayback;
         if (!playback || playback.player !== player || playback.token !== session ||
             playback.idx !== currentIdx || playback.ended || player.ended || !player.paused) return;
@@ -592,6 +608,7 @@ HTML_PAGE = """
             pending_transition: transition ? {from: transition.from, to: transition.to, elapsed_ms: performance.now() - transition.ended} : null,
             buffer_hits: diagnostics.hits, buffer_misses: diagnostics.misses,
             recovery_attempts: diagnostics.recoveryAttempts,
+            stream: {...diagnostics.stream},
             dropped_events: diagnostics.dropped, dropped_gap_samples: diagnostics.droppedGaps,
             cache: {fragments: prefetchCache.size, bytes: cacheBytes()},
             note: 'Hidden nie potwierdza blokady ekranu. media_event zawiera stan odtwarzacza i currentTime. Po powrocie do widocznej strony wykonywany jest punkt kontrolny po 5 s; playback_advanced oznacza zmianę currentTime ponad 0,05 s. Przerwy ended/playing mierzą callbacki. Rejestrowanych jest maksymalnie 2000 zdarzeń.',
@@ -615,6 +632,7 @@ HTML_PAGE = """
     function releaseJob(job) {
         if (job.key === attachedKey) return false;
         if (job.url) { URL.revokeObjectURL(job.url); trace('cache_release', {fragment: job.idx, bytes: job.bytes}); job.url = null; }
+        job.blob = null;
         prefetchCache.delete(job.key);
         if (job.status === 'done') job.status = 'deferred';
         return true;
@@ -644,6 +662,7 @@ HTML_PAGE = """
         }
         if (cacheBytes() + blob.size > CACHE_MAX_BYTES || prefetchCache.size >= CACHE_MAX_FRAGMENTS) return false;
         job.bytes = blob.size;
+        job.blob = blob;
         job.url = URL.createObjectURL(blob);
         prefetchCache.set(job.key, job);
         trace('cache_store', {fragment: job.idx, bytes: job.bytes, cache_bytes: cacheBytes(), cache_fragments: prefetchCache.size});
@@ -822,6 +841,292 @@ HTML_PAGE = """
         })();
     }
 
+    function setCurrentSentenceVisual(idx, force = false) {
+        if (idx < 0 || idx >= sentences.length || (idx === currentIdx && !force)) return;
+        currentIdx = idx;
+        document.querySelectorAll('.sentence').forEach(el => el.classList.remove('active'));
+        const activeEl = document.getElementById('sent-' + idx);
+        if (activeEl) {
+            activeEl.classList.add('active');
+            activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
+        }
+        document.getElementById('progressBar').style.width = (((idx + 1) / sentences.length) * 100) + '%';
+        if (!isPaused) setStatus(`Czytanie zdania ${idx + 1} z ${sentences.length}`);
+    }
+
+    function nextSpeakableIndex(idx) {
+        while (idx < sentences.length && !sentences[idx].trim()) idx++;
+        return idx;
+    }
+
+    function streamBufferedEnd(sourceBuffer) {
+        const ranges = sourceBuffer?.buffered;
+        if (!ranges?.length) return 0;
+        return ranges.end(ranges.length - 1);
+    }
+
+    function streamBufferedStart(sourceBuffer) {
+        const ranges = sourceBuffer?.buffered;
+        if (!ranges?.length) return 0;
+        return ranges.start(0);
+    }
+
+    function retainedSegmentBytes(segment) {
+        const start = Math.max(segment.start, segment.retainedStart ?? segment.start);
+        return segment.end <= start ? 0 : segment.bytes * (segment.end - start) / Math.max(0.001, segment.end - segment.start);
+    }
+
+    function streamStateIsCurrent(state) {
+        return continuousPlayback === state && !state.cancelled && state.token === session && state.player === audio;
+    }
+
+    function streamFail(state, error, restartIndex = state.currentIndex) {
+        if (!streamStateIsCurrent(state)) return;
+        const wasPaused = isPaused;
+        const idx = Math.max(0, Math.min(sentences.length - 1, Number.isFinite(restartIndex) ? restartIndex : currentIdx));
+        trace('stream_error', {code: error?.name || 'stream_error', fragment: idx});
+        if (diagnostics) {
+            diagnostics.stream.mode = 'fallback';
+            diagnostics.stream.last_error = error?.name || 'stream_error';
+        }
+        trace('stream_fallback', {fragment: idx, reason: error?.name || 'stream_error'});
+        window.stopReading();
+        currentIdx = idx;
+        isReading = true;
+        isPaused = wasPaused;
+        setMediaPlaybackState(wasPaused ? 'paused' : 'playing');
+        document.getElementById('playBtn').innerText = wasPaused ? '▶' : '⏸';
+        playCurrent();
+    }
+
+    function handleStreamUpdateEnd(state) {
+        if (!streamStateIsCurrent(state)) return;
+        const sourceBuffer = state.sourceBuffer;
+        if (state.pendingRemove !== null) {
+            const cutoff = state.pendingRemove;
+            state.pendingRemove = null;
+            state.appended = state.appended.filter(segment => segment.end > cutoff);
+            for (const segment of state.appended) segment.retainedStart = Math.max(segment.retainedStart ?? segment.start, cutoff);
+            state.bufferedBytes = state.appended.reduce((sum, segment) => sum + retainedSegmentBytes(segment), 0);
+            state.lastRemovedTo = cutoff;
+            if (diagnostics) diagnostics.stream.buffered_bytes = state.bufferedBytes;
+            trace('stream_remove', {before_seconds: cutoff, buffered_bytes: state.bufferedBytes});
+        } else if (state.pendingAppend) {
+            const appended = state.pendingAppend;
+            state.pendingAppend = null;
+            const end = streamBufferedEnd(sourceBuffer);
+            const start = state.timelineEnd;
+            if (!Number.isFinite(end) || end <= start + 0.001) {
+                streamFail(state, new Error('SourceBuffer returned no playable range.'), state.currentIndex);
+                return;
+            }
+            state.timelineEnd = end;
+            state.appended.push({idx: appended.idx, start, end, bytes: appended.bytes, retainedStart: start});
+            state.bufferedBytes += appended.bytes;
+            state.nextAppendIdx = appended.idx + 1;
+            if (diagnostics) {
+                diagnostics.stream.appended_bytes += appended.bytes;
+                diagnostics.stream.buffered_bytes = state.bufferedBytes;
+                diagnostics.stream.buffered_seconds = Math.max(0, end - state.player.currentTime);
+            }
+            trace('stream_append_end', {fragment: appended.idx, byte_length: appended.bytes,
+                start_seconds: start, end_seconds: end, buffered_bytes: state.bufferedBytes,
+                buffered_seconds: Math.max(0, end - state.player.currentTime)});
+            releaseJob(appended.job);
+            jobs.delete(appended.job.key);
+            if (!state.playCalled) {
+                state.playCalled = true;
+                ready = true;
+                loading = false;
+                if (!isPaused) {
+                    setMediaPlaybackState('playing');
+                    state.player.play().then(() => {
+                        if (streamStateIsCurrent(state) && !isPaused) {
+                            state.started = true;
+                            trace('stream_playing', {fragment: state.currentIndex});
+                        }
+                    }).catch(error => streamFail(state, error, state.currentIndex));
+                }
+            }
+        }
+        if (state.nextAppendIdx >= sentences.length && !state.pendingFailure && !state.ended &&
+            state.mediaSource.readyState === 'open' && !sourceBuffer.updating) {
+            try {
+                state.mediaSource.endOfStream();
+                state.ended = true;
+                trace('stream_end_of_stream', {fragments: state.appended.length});
+            } catch (error) { streamFail(state, error, state.currentIndex); return; }
+        }
+        updateContinuousPosition(state);
+        pumpContinuous(state);
+    }
+
+    function trimContinuousBuffer(state) {
+        const sourceBuffer = state.sourceBuffer;
+        if (!sourceBuffer || sourceBuffer.updating || state.pendingRemove !== null ||
+            state.mediaSource.readyState !== 'open') return;
+        const cutoff = state.player.currentTime - STREAM_RETAIN_SECONDS;
+        const start = streamBufferedStart(sourceBuffer);
+        if (cutoff <= start || cutoff - state.lastRemovedTo < 2) return;
+        try {
+            state.pendingRemove = cutoff;
+            sourceBuffer.remove(start, cutoff);
+            trace('stream_remove_start', {from_seconds: start, to_seconds: cutoff});
+        } catch (error) {
+            state.pendingRemove = null;
+            streamFail(state, error, state.currentIndex);
+        }
+    }
+
+    function updateContinuousPosition(state) {
+        if (!streamStateIsCurrent(state)) return;
+        const time = state.player.currentTime;
+        let currentSegment = state.appended.find(segment => time >= segment.start && time < segment.end);
+        if (currentSegment) setCurrentSentenceVisual(currentSegment.idx);
+        else {
+            const last = state.appended[state.appended.length - 1];
+            if (last && time >= last.end - 0.05 && last.idx + 1 < sentences.length) {
+                const next = nextSpeakableIndex(last.idx + 1);
+                if (next < sentences.length) setCurrentSentenceVisual(next);
+            }
+        }
+        state.currentIndex = currentIdx;
+        if (diagnostics) {
+            diagnostics.stream.buffered_bytes = state.bufferedBytes;
+            diagnostics.stream.buffered_seconds = Math.max(0, streamBufferedEnd(state.sourceBuffer) - time);
+        }
+        trimContinuousBuffer(state);
+        pumpContinuous(state);
+    }
+
+    function handleContinuousWaiting(state) {
+        if (!streamStateIsCurrent(state)) return;
+        trace('stream_waiting', {fragment: state.currentIndex,
+            buffered_seconds: Math.max(0, streamBufferedEnd(state.sourceBuffer) - state.player.currentTime)});
+        if (state.pendingFailure) {
+            const failure = state.pendingFailure;
+            state.pendingFailure = null;
+            streamFail(state, failure.error, failure.idx);
+            return;
+        }
+        pumpContinuous(state);
+    }
+
+    async function pumpContinuous(state) {
+        if (!streamStateIsCurrent(state) || !state.sourceBuffer || state.sourceBuffer.updating || state.pumping || state.pendingFailure) return;
+        state.pumping = true;
+        try {
+            while (streamStateIsCurrent(state) && !state.sourceBuffer.updating) {
+                const idx = state.nextAppendIdx;
+                if (idx >= sentences.length) break;
+                if (idx > state.currentIndex + bufferMode) break;
+                if (!sentences[idx].trim()) {
+                    state.nextAppendIdx++;
+                    continue;
+                }
+                const audioUrl = await fetchAudioBlob(idx, controller.signal, idx === state.currentIndex);
+                if (!streamStateIsCurrent(state)) return;
+                if (!audioUrl) throw new Error('Brak miejsca na fragment audio.');
+                const job = [...prefetchCache.values()].find(candidate => candidate.url === audioUrl);
+                if (!job?.blob) throw new Error('Brak danych audio do dopisania.');
+                if (state.bufferedBytes > 0 && state.bufferedBytes + job.bytes > STREAM_BUFFER_MAX_BYTES) break;
+                const data = await job.blob.arrayBuffer();
+                if (!streamStateIsCurrent(state)) return;
+                state.pendingAppend = {idx, bytes: job.bytes, job};
+                if (diagnostics) trace('stream_append_start', {fragment: idx, byte_length: job.bytes});
+                state.sourceBuffer.appendBuffer(data);
+                break;
+            }
+        } catch (error) {
+            if (!streamStateIsCurrent(state) || error?.name === 'AbortError') return;
+            const failedIndex = state.nextAppendIdx;
+            if (state.appended.length) {
+                state.pendingFailure = {idx: failedIndex, error};
+                trace('stream_error_waiting_for_buffer_end', {fragment: failedIndex, code: error?.name || 'stream_error'});
+            } else streamFail(state, error, failedIndex);
+        } finally {
+            state.pumping = false;
+            if (streamStateIsCurrent(state) && state.nextAppendIdx >= sentences.length && !state.pendingFailure &&
+                !state.ended && state.mediaSource.readyState === 'open' && !state.sourceBuffer.updating) {
+                try {
+                    state.mediaSource.endOfStream();
+                    state.ended = true;
+                    trace('stream_end_of_stream', {fragments: state.appended.length});
+                } catch (error) { streamFail(state, error, state.currentIndex); }
+            }
+        }
+    }
+
+    function startContinuousPlayback(idx) {
+        idx = nextSpeakableIndex(idx);
+        if (idx >= sentences.length) {
+            window.stopReading();
+            setStatus('Zakończono czytanie');
+            return;
+        }
+        setCurrentSentenceVisual(idx, true);
+        let supported = false;
+        try { supported = typeof MediaSource === 'function' && typeof MediaSource.isTypeSupported === 'function' && MediaSource.isTypeSupported(STREAM_MIME); }
+        catch {}
+        if (diagnostics) {
+            diagnostics.stream.mode = supported ? 'mse_initializing' : 'fallback';
+            diagnostics.stream.is_type_supported = supported;
+        }
+        trace('stream_capability', {mime_type: STREAM_MIME, is_type_supported: supported});
+        if (!supported) {
+            trace('stream_fallback', {fragment: idx, reason: 'mime_not_supported'});
+            playCurrent();
+            return;
+        }
+        let state = null;
+        try {
+            const mediaSource = new MediaSource();
+            state = {token: session, player: audio, mediaSource, sourceBuffer: null, objectUrl: null,
+                currentIndex: idx, nextAppendIdx: idx, appended: [], timelineEnd: 0, bufferedBytes: 0,
+                lastRemovedTo: 0, pendingAppend: null, pendingRemove: null, pendingFailure: null,
+                pumping: false, playCalled: false, started: false, ended: false, cancelled: false};
+            continuousPlayback = state;
+            activePlayback = null;
+            state.objectUrl = URL.createObjectURL(mediaSource);
+            state.player.ontimeupdate = () => updateContinuousPosition(state);
+            state.player.onwaiting = () => handleContinuousWaiting(state);
+            state.player.onended = () => {
+                if (!streamStateIsCurrent(state)) return;
+                state.ended = true;
+                const last = state.appended[state.appended.length - 1];
+                if (last) setCurrentSentenceVisual(last.idx);
+                trace('stream_ended', {fragments: state.appended.length});
+                window.stopReading();
+                setStatus('Zakończono czytanie');
+            };
+            state.player.onerror = () => streamFail(state, new Error('Nie można odtworzyć strumienia MP3.'), state.currentIndex);
+            mediaSource.addEventListener('sourceopen', () => {
+                if (!streamStateIsCurrent(state)) return;
+                try {
+                    state.sourceBuffer = mediaSource.addSourceBuffer(STREAM_MIME);
+                    state.sourceBuffer.mode = 'sequence';
+                    state.sourceBuffer.addEventListener('updateend', () => handleStreamUpdateEnd(state));
+                    state.sourceBuffer.addEventListener('error', () => streamFail(state, new Error('SourceBuffer append failed.'), state.currentIndex));
+                    if (diagnostics) diagnostics.stream.mode = 'mse';
+                    trace('stream_open', {mime_type: STREAM_MIME, mode: state.sourceBuffer.mode});
+                    pumpContinuous(state);
+                } catch (error) { streamFail(state, error, state.currentIndex); }
+            }, {once: true});
+            state.player.src = state.objectUrl;
+            isReading = true;
+            ready = false;
+            loading = true;
+            if (mediaSource.readyState === 'open') mediaSource.dispatchEvent(new Event('sourceopen'));
+        } catch (error) {
+            if (state && streamStateIsCurrent(state)) streamFail(state, error, idx);
+            else {
+                if (diagnostics) { diagnostics.stream.mode = 'fallback'; diagnostics.stream.last_error = error?.name || 'setup_error'; }
+                trace('stream_fallback', {fragment: idx, reason: error?.name || 'setup_error'});
+                playCurrent();
+            }
+        }
+    }
+
     function playbackFailed(error, token) {
         if (token !== session) return;
         trace("playback_error");
@@ -919,7 +1224,15 @@ HTML_PAGE = """
         isReading = true;
         setMediaPlaybackState('playing');
         document.getElementById('playBtn').innerText = '⏸';
-        playCurrent();
+        document.querySelectorAll('.sentence').forEach(el => el.classList.remove('active'));
+        const activeEl = document.getElementById('sent-' + idx);
+        if (activeEl) {
+            activeEl.classList.add('active');
+            activeEl.scrollIntoView({behavior: 'smooth', block: 'center'});
+        }
+        document.getElementById('progressBar').style.width = (((idx + 1) / sentences.length) * 100) + '%';
+        setStatus(`Czytanie zdania ${idx + 1} z ${sentences.length}`);
+        startContinuousPlayback(idx);
     };
 
     window.togglePlay = function() {
@@ -941,7 +1254,12 @@ HTML_PAGE = """
             isPaused = false;
             setMediaPlaybackState('playing');
             document.getElementById('playBtn').innerText = '⏸';
-            if (ready) playReady(session);
+            if (continuousPlayback && continuousPlayback.token === session) {
+                if (continuousPlayback.playCalled) {
+                    continuousPlayback.player.play().catch(error => streamFail(continuousPlayback, error, currentIdx));
+                } else pumpContinuous(continuousPlayback);
+            }
+            else if (ready) playReady(session);
             else if (!loading) playCurrent();
             else showGenerationStatus();
         }
@@ -950,6 +1268,14 @@ HTML_PAGE = """
     window.stopReading = function() {
         finishTransition('cancelled');
         trace('stop');
+        const previousStream = continuousPlayback;
+        continuousPlayback = null;
+        if (previousStream) {
+            previousStream.cancelled = true;
+            if (previousStream.sourceBuffer?.updating) {
+                try { previousStream.sourceBuffer.abort(); } catch {}
+            }
+        }
         session++;
         activePlayback = null;
         controller.abort();
@@ -966,6 +1292,7 @@ HTML_PAGE = """
         audio.pause();
         audio.removeAttribute('src');
         audio.load();
+        if (previousStream?.objectUrl) URL.revokeObjectURL(previousStream.objectUrl);
         setMediaPlaybackState('none');
         audio = new Audio();
         observePlaybackPause(audio);

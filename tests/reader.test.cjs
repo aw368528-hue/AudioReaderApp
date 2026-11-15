@@ -3,9 +3,9 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const script = fs.readFileSync(0, 'utf8');
 async function settle() { for (let n = 0; n < 12; n++) await new Promise(r => setTimeout(r, 1)); }
-const ok = () => ({ok: true, blob: async () => ({size: 10})});
+const ok = () => ({ok: true, blob: async () => ({size: 10, arrayBuffer: async () => new ArrayBuffer(10)})});
 const failed = (status = 502) => ({ok: false, status, headers: {get: () => null}, json: async () => ({error: 'Błąd syntezy'})});
-function harness(fetch, query = '', withMediaSession = true) {
+function harness(fetch, query = '', withMediaSession = true, mseSupport = null) {
     const elements = new Map();
     function element() {
         return {value: '', style: {}, innerText: '', innerHTML: '', children: [],
@@ -20,11 +20,21 @@ function harness(fetch, query = '', withMediaSession = true) {
     const mediaActions = {};
     const mediaSession = {playbackState: 'none', metadata: null,
         setActionHandler(action, callback) { mediaActions[action] = callback; }};
+    const mediaSources = [];
+    const sourceBuffers = [];
     let performanceTime = 0;
     class Audio {
-        constructor() { this.plays = 0; this.src = ''; this.paused = true; this.ended = false;
+        constructor() { this.plays = 0; this._src = ''; this.paused = true; this.ended = false;
             this.currentTime = 0; this.duration = 12; this.readyState = 4; this.networkState = 1;
             this.playbackRate = 1; this.listeners = {}; audios.push(this); }
+        get src() { return this._src; }
+        set src(value) {
+            this._src = value;
+            if (value.startsWith('mse:')) setTimeout(() => {
+                const source = mediaSources.find(item => item.url === value);
+                if (source) { source.readyState = 'open'; source.dispatchEvent(new Event('sourceopen')); }
+            }, 0);
+        }
         async play() { this.plays++; this.paused = false; }
         pause() { this.paused = true; this.dispatch('pause'); }
         load() { this.loads = (this.loads || 0) + 1; }
@@ -32,23 +42,50 @@ function harness(fetch, query = '', withMediaSession = true) {
         addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
         dispatch(type) { for (const callback of this.listeners[type] || []) callback({type}); }
     }
+    class SourceBuffer {
+        constructor() { this.mode = 'segments'; this.updating = false; this.listeners = {}; this.ranges = []; sourceBuffers.push(this); }
+        get buffered() { const ranges = this.ranges; return {length:ranges.length, start:i=>ranges[i].start, end:i=>ranges[i].end}; }
+        addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
+        emit(type) { for (const callback of this.listeners[type] || []) callback({type}); }
+        appendBuffer() {
+            if (mseSupport === 'append_error') throw new Error('AppendError');
+            this.updating = true;
+            setTimeout(() => { const end=this.ranges.at(-1)?.end || 0; this.ranges.push({start:end,end:end+10}); this.updating=false; this.emit('updateend'); }, 0);
+        }
+        remove(start,end) {
+            this.updating = true;
+            setTimeout(() => { this.ranges=this.ranges.filter(range=>range.end>end); if(this.ranges.length && this.ranges[0].start<end)this.ranges[0].start=end; this.updating=false; this.emit('updateend'); }, 0);
+        }
+        abort() { this.updating=false; }
+    }
+    class MediaSource {
+        constructor() { this.readyState='closed'; this.listeners={}; this.url=null; mediaSources.push(this); }
+        static isTypeSupported(type) { return (mseSupport === true || mseSupport === 'add_error' || mseSupport === 'append_error') && type === 'audio/mpeg'; }
+        addEventListener(type,callback,options={}) { this.listeners[type]={callback,once:!!options.once}; }
+        dispatchEvent(event) { const listener=this.listeners[event.type]; if(listener){listener.callback(event); if(listener.once)delete this.listeners[event.type];} }
+        addSourceBuffer(type) { if(type!=='audio/mpeg'||mseSupport==='add_error')throw new Error('NotSupportedError'); return new SourceBuffer(); }
+        endOfStream() { this.readyState='ended'; }
+    }
     let now = 0;
     const delays = [];
     class Clock extends Date { static now() { return now; } }
-    const context = vm.createContext({window: {}, location: {search: query}, URLSearchParams, Blob,
+    const context = vm.createContext({window: {}, location: {search: query}, URLSearchParams, Blob, Event,
         navigator: {clipboard: {writeText: async text => { context.copied = text; }}, ...(withMediaSession ? {mediaSession} : {})},
         MediaMetadata: class MediaMetadata { constructor(data) { Object.assign(this, data); } },
         performance: {now: () => performanceTime}, document: {body, visibilityState: 'visible',
         addEventListener(type, callback) { documentListeners[type] = callback; },
         getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); },
-        createElement: element, querySelectorAll: () => []}, Audio, fetch, FormData, AbortController,
-        DOMException, TypeError, URL: {createObjectURL: blob => { const url = `blob:${created.length}`; created.push({url, blob}); return url; }, revokeObjectURL: url => revoked.push(url)},
+        createElement: element, querySelectorAll: () => []}, Audio, ...(mseSupport === null ? {} : {MediaSource}), fetch, FormData, AbortController,
+        DOMException, TypeError, URL: {createObjectURL: blob => {
+            if (blob instanceof MediaSource) { const url=`mse:${mediaSources.length}`; blob.url=url; return url; }
+            const url = `blob:${created.length}`; created.push({url, blob}); return url;
+        }, revokeObjectURL: url => revoked.push(url)},
         Date: Clock, setTimeout: (fn, ms) => { delays.push(ms); return setTimeout(() => { now += ms; fn(); }, 0); }, clearTimeout, alert() {}});
     vm.runInContext(script, context);
     const run = code => vm.runInContext(code, context);
     context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
     context.document.getElementById('rateSlider').value = '0';
-    return {run, context, elements, audios, delays, revoked, created, documentListeners, mediaSession, mediaActions,
+    return {run, context, elements, audios, delays, revoked, created, documentListeners, mediaSession, mediaActions, mediaSources, sourceBuffers,
         advance(ms) { performanceTime += ms; }};
 }
 const cases = [];
@@ -841,6 +878,91 @@ test('Przejście fragmentu nie resetuje elementu audio ani nie narusza zwalniani
     assert.notEqual(player.src, firstUrl);
     assert.ok(h.revoked.includes(firstUrl), 'completed fragment URL should be released');
     assert.ok(h.run('prefetchCache.has([...jobs.values()].find(job=>job.idx===1)?.key)'), 'next cached fragment remains attached');
+});
+test('MOB-06: MSE appenduje MP3 w kolejności do jednego źródła bez play na granicy zdań', async () => {
+    const h = harness(async()=>ok(), '?test=1&buffer=2', true, true);
+    h.run('sentences=["A.","B.","C.","D."]; window.startFrom(0)');
+    await settle();
+    const player = h.audios.at(-1);
+    assert.equal(h.run('diagnosticReport().stream.mode'), 'mse');
+    assert.equal(h.run('diagnosticReport().stream.is_type_supported'), true);
+    assert.equal(h.sourceBuffers.length, 1);
+    assert.equal(h.sourceBuffers[0].mode, 'sequence');
+    assert.equal(h.sourceBuffers[0].ranges.length, 3, 'buffer=2 appends the current segment and two ahead');
+    assert.equal(player.plays, 1);
+    assert.equal(player.src, 'mse:1');
+    assert.equal(h.run('diagnosticReport().stream.appended_bytes'), 30);
+    assert.equal(h.run('jobs.size'), 0, 'appended sentence text is not retained by the synthesis job map');
+    const source = player.src;
+    h.run('audio.currentTime=10; audio.ontimeupdate()'); await settle();
+    assert.equal(h.run('currentIdx'), 1);
+    assert.equal(h.sourceBuffers[0].ranges.length, 4);
+    assert.equal(h.run('diagnosticReport().stream.appended_bytes'), 40);
+    h.run('audio.currentTime=20; audio.ontimeupdate()'); await settle();
+    assert.equal(h.run('currentIdx'), 2);
+    assert.equal(player.src, source);
+    assert.equal(player.plays, 1, 'play() is called once for the whole stream');
+    h.run('audio.ended=true; audio.onended()');
+    assert.equal(h.run('isReading'), false);
+    assert.equal(h.context.document.getElementById('progressBar').style.width, '100%');
+});
+test('MOB-06: buffer=0 czeka na koniec bieżącego bufora przed dopisaniem następnego MP3', async () => {
+    const h = harness(async()=>ok(), '?test=1&buffer=0', true, true);
+    h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+    const player = h.audios.at(-1);
+    assert.equal(h.sourceBuffers[0].ranges.length, 1);
+    assert.equal(h.sourceBuffers[0].mode, 'sequence');
+    h.run('audio.currentTime=10; audio.ontimeupdate()'); await settle();
+    assert.equal(h.sourceBuffers[0].ranges.length, 2);
+    assert.equal(h.run('currentIdx'), 1);
+    assert.equal(player.plays, 1);
+});
+test('MOB-06: brak obsługi MSE, addSourceBuffer lub append bezpiecznie przechodzi na audio Blob', async () => {
+    for (const support of [false, 'add_error', 'append_error']) {
+        const h = harness(async()=>ok(), '?test=1', true, support);
+        h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+        assert.equal(h.run('isReading'), true);
+        assert.equal(h.audios.at(-1).src.startsWith('blob:'), true);
+        assert.equal(h.audios.at(-1).plays, 1);
+        assert.equal(h.run('diagnosticReport().stream.mode'), 'fallback');
+    }
+});
+test('MOB-06: zmiana sesji anuluje opóźniony TTS przed dopisaniem do SourceBuffer', async () => {
+    let finish;
+    const h = harness(async()=>new Promise(resolve=>{finish=()=>resolve(ok());}), '?test=1&buffer=2', true, true);
+    h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+    const player = h.audios.at(-1);
+    h.run('window.stopReading()');
+    finish(); await settle();
+    assert.equal(h.sourceBuffers.length, 1);
+    assert.equal(h.sourceBuffers[0].ranges.length, 0, 'cancelled generation must never append');
+    assert.equal(player.plays, 0);
+    assert.equal(h.run('isReading'), false);
+});
+test('MOB-06: błędne TTS przechodzi do ograniczonego fallbacku i zgłasza błąd', async () => {
+    let calls = 0;
+    const h = harness(async()=>{calls++; return failed(400);}, '?test=1', true, true);
+    h.run('sentences=["A.","B."]; window.startFrom(0)'); await settle();
+    assert.equal(h.run('diagnosticReport().stream.mode'), 'fallback');
+    assert.equal(h.run('diagnosticReport().stream.last_error'), 'Error');
+    assert.equal(h.run('isReading'), false);
+    assert.equal(calls, 2, 'one MSE request and one bounded legacy fallback request');
+});
+test('MOB-06: Media Session, pauza, wznowienie i skip zachowują sesję stream', async () => {
+    const h = harness(async()=>ok(), '?test=1&buffer=2', true, true);
+    h.run('sentences=["A.","B.","C."]; window.startFrom(0)'); await settle();
+    const firstPlayer=h.audios.at(-1);
+    assert.equal(h.mediaSession.playbackState, 'playing');
+    h.mediaActions.pause();
+    assert.equal(h.run('isPaused'), true);
+    assert.equal(firstPlayer.paused, true);
+    h.mediaActions.play(); await settle();
+    assert.equal(h.run('isPaused'), false);
+    assert.equal(firstPlayer.plays, 2);
+    h.run('window.skip(2)'); await settle();
+    assert.equal(h.run('currentIdx'), 2);
+    assert.equal(h.audios.at(-1).src.startsWith('mse:'), true);
+    assert.equal(h.mediaSession.playbackState, 'playing');
 });
 test('Przełącznik bufora i zmiana dokumentu czyszczą poprzednią sesję', async () => {
     const h=harness(async()=>ok(), '?test=1&buffer=2');
