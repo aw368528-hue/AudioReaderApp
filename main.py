@@ -92,14 +92,16 @@ HTML_PAGE = """
             padding: 12px; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 8px;
         }
         .app-views { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; }
+        #readerView { overflow: hidden; }
+        .reader-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
         #sentenceList { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
         .history-scroll { min-height: 0; display: flex; flex-direction: column; gap: 10px; overflow: auto; overscroll-behavior: contain; }
         #historyView { overflow: hidden; }
         .history-scroll { flex: 1 1 auto; }
         #calendarView[hidden] { display: none; }
-        .reader-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto; min-width: 0; }
-        .doc-title { min-width: 0; max-width: 58%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .88rem; font-weight: 600; }
-        .reader-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
+        .reader-toolbar { display: flex; flex-direction: column; align-items: stretch; gap: 6px; flex: 0 0 auto; min-width: 0; }
+        .doc-title { width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .88rem; font-weight: 600; }
+        .reader-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
         .add-content-btn, .resume-actions button, .library-entry button, .history-entry button, .history-toolbar button {
             min-height: 44px; border: 0; border-radius: 12px; padding: 9px 12px; color: var(--text);
             background: var(--surface-light); font: inherit; font-weight: 600; cursor: pointer;
@@ -209,13 +211,14 @@ HTML_PAGE = """
             .add-content-dialog { position: fixed; inset: auto 0 0; width: 100%; max-width: none; max-height: min(88dvh, 760px); margin: 0; border-radius: 20px 20px 0 0; }
             .sheet-content { padding-bottom: max(18px, env(safe-area-inset-bottom)); }
         }
+        @media (max-width: 480px) {
+            .history-toolbar { align-items: stretch; flex-direction: column; }
+            .history-subnav { width: 100%; }
+            .history-subnav button { flex: 1 1 0; white-space: nowrap; }
+        }
         @media (max-width: 360px) {
             body { padding-left: 9px; padding-right: 9px; gap: 7px; }
             .view-box { padding: 9px; }
-            .reader-toolbar { flex-wrap: wrap; }
-            .history-toolbar { flex-wrap: wrap; }
-            .doc-title { max-width: 100%; flex: 1 1 100%; }
-            .reader-actions { width: 100%; justify-content: flex-start; }
             .history-entry, .library-entry { gap: 6px; padding: 7px; }
             .history-entry button, .library-entry button { padding-left: 9px; padding-right: 9px; }
         }
@@ -265,10 +268,12 @@ HTML_PAGE = """
                 <button class="add-content-btn" id="addContentButton" onclick="window.openAddContentDialog()">＋ Dodaj treść</button>
             </div>
         </div>
-        <div class="reader-empty" id="readerEmpty">
-            <span>Dodaj dokument lub wklej tekst, aby rozpocząć słuchanie.</span>
+        <div class="reader-scroll" id="readerScroll">
+          <div class="reader-empty" id="readerEmpty">
+              <span>Dodaj dokument lub wklej tekst, aby rozpocząć słuchanie.</span>
+          </div>
+          <div id="sentenceList"></div>
         </div>
-        <div id="sentenceList"></div>
       </section>
 
       <section class="view-box" id="historyView" aria-label="Historia odsłuchów" style="display:none;">
@@ -400,15 +405,18 @@ HTML_PAGE = """
         document.getElementById('textImportForm').hidden = true;
         setImportStatus('');
         document.body.classList.add('modal-open');
-        if (typeof dialog.showModal === 'function') dialog.showModal();
+        dialog.hidden = false;
+        if (typeof dialog.showModal === 'function') { if (!dialog.open) dialog.showModal(); }
         else { dialog.open = true; dialog.hidden = false; }
         document.getElementById('chooseFileImport').focus?.();
     };
 
     window.closeAddContentDialog = function() {
         const dialog = document.getElementById('addContentDialog');
-        if (typeof dialog.close === 'function' && dialog.open) dialog.close();
-        else { dialog.open = false; dialog.hidden = true; document.body.classList.remove('modal-open', 'keyboard-open'); }
+        const nativeDialog = typeof dialog.showModal === 'function' && typeof dialog.close === 'function';
+        if (nativeDialog) { if (dialog.open) dialog.close(); }
+        else { dialog.open = false; dialog.hidden = true; }
+        document.body.classList.remove('modal-open', 'keyboard-open');
         dialogReturnFocus?.focus?.();
     };
 
@@ -427,6 +435,11 @@ HTML_PAGE = """
     });
     document.getElementById('addContentDialog').addEventListener('close', () => {
         document.body.classList.remove('modal-open', 'keyboard-open');
+        dialogReturnFocus?.focus?.();
+    });
+    document.getElementById('addContentDialog').addEventListener('cancel', () => {
+        document.body.classList.remove('modal-open', 'keyboard-open');
+        dialogReturnFocus?.focus?.();
     });
     document.getElementById('rawText').addEventListener('focus', () => document.body.classList.add('keyboard-open'));
     document.getElementById('rawText').addEventListener('blur', () => document.body.classList.remove('keyboard-open'));
@@ -460,8 +473,11 @@ HTML_PAGE = """
         const compactStatus = document.getElementById('resumeDelete');
         compactStatus.hidden = !!record || !saveWarning;
         compactStatus.textContent = compactStatus.hidden ? '' : detail;
-        if (record) document.getElementById('resumeContinue').textContent = record.completed
-            ? 'Czytaj od początku' : 'Kontynuuj od tego miejsca';
+        if (record) {
+            const button=document.getElementById('resumeContinue');
+            button.textContent = record.completed ? 'Od początku' : 'Kontynuuj';
+            button.setAttribute?.('aria-label', record.completed ? 'Czytaj ukończony dokument od początku' : 'Kontynuuj czytanie od zapisanego miejsca');
+        }
     }
 
     function openResumeDatabase() {
@@ -686,9 +702,13 @@ HTML_PAGE = """
             const name=item.documentName || historyDocuments.find(d=>d.id===item.documentId)?.name || 'Dokument usunięty';
             const title=document.createElement('strong'); title.className='history-entry-title'; title.innerText=name; title.title=name; copy.appendChild(title);
             const voiceLabels={'pl-PL-MarekNeural':'Marek','pl-PL-ZofiaNeural':'Zofia'};
-            const details=[time, voiceLabels[item.voice] || (item.voice ? item.voice.replace('pl-PL-','') : ''), statusLabels[item.status] || item.status];
-            if (Number.isFinite(item.endedAt) && item.endedAt >= item.startedAt) details.splice(1, 0, new Intl.DateTimeFormat('pl-PL',{hour:'2-digit',minute:'2-digit'}).format(new Date(item.endedAt)));
-            if (Number.isFinite(item.playedMs) && item.playedMs >= 0) details.push(`${Math.round(item.playedMs/60000)} min odsłuchu`);
+            const details=[`Start: ${time}`, voiceLabels[item.voice] || (item.voice ? item.voice.replace('pl-PL-','') : ''), statusLabels[item.status] || item.status];
+            if (Boolean(item.endedAt) && Number.isFinite(item.endedAt) && item.endedAt >= item.startedAt)
+                details.splice(1, 0, `Koniec: ${new Intl.DateTimeFormat('pl-PL',{hour:'2-digit',minute:'2-digit'}).format(new Date(item.endedAt))}`);
+            if (Number.isFinite(item.playedMs) && item.playedMs > 0) {
+                const seconds=Math.floor(item.playedMs/1000), duration=`${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`;
+                details.push(`Czas: ${duration}`);
+            }
             const meta=document.createElement('span'); meta.className='history-entry-meta'; meta.innerText=details.filter(Boolean).join(' • '); copy.appendChild(meta);
             row.appendChild(copy);
             const doc=historyDocuments.find(d=>d.id===item.documentId);

@@ -104,7 +104,8 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
             classList: {toggle(name, force) { const active=force === undefined ? !classes.has(name) : !!force; if(active)classes.add(name);else classes.delete(name);return active; }, add(name) { classes.add(name); }, remove(...names) { names.forEach(name=>classes.delete(name)); }, contains(name) { return classes.has(name); }},
             listeners: {}, click() { this.clickCount++; this.onclick?.({target:this}); this.listeners.click?.({target:this}); }, remove() {},
             focus() { this.focused = true; }, setAttribute(name,value) { this.attributes[name]=String(value); },
-            showModal() { this.open=true; this.hidden=false; }, close() { this.open=false; this.hidden=true; this.listeners.close?.({target:this}); },
+            showModal() { this.showModalCalls=(this.showModalCalls||0)+1; if(this.hidden)throw Error('dialog_hidden'); this.open=true; }, close() { this.open=false; this.listeners.close?.({target:this}); },
+            dispatch(type, event={}) { this.listeners[type]?.({type,target:this,...event}); },
             appendChild(child) { this.children.push(child); }, addEventListener(type, callback) { this.listeners[type] = callback; }, scrollIntoView() { this.scrollCount=(this.scrollCount||0)+1; }};
     }
     const audios = [];
@@ -1516,6 +1517,8 @@ test('UX-01 wklejony tekst i miejsce wracają lokalnie bez automatycznego odtwar
     assert.equal(reopened.context.document.getElementById('voiceSelect').value, 'pl-PL-MarekNeural');
     assert.equal(reopened.context.document.getElementById('rateSlider').value, '20');
     assert.equal(reopened.context.document.getElementById('resumeContinue').hidden, false);
+    assert.equal(reopened.context.document.getElementById('resumeContinue').textContent, 'Kontynuuj');
+    assert.equal(reopened.context.document.getElementById('resumeContinue').attributes['aria-label'], 'Kontynuuj czytanie od zapisanego miejsca');
     assert.equal(reopenedFetches, 0, 'restoring a document does not send it to the backend or generate TTS');
     assert.match(reopened.context.document.getElementById('resumeNote').textContent, /lokalnie w tej przeglądarce/);
     reopened.run('window.continueSavedDocument()'); await settle();
@@ -1590,7 +1593,8 @@ test('UX-01 końcówka dokumentu zapisuje ukończenie i pozwala zacząć od pocz
     await settle();
     assert.equal(reopened.run('isReading'), false);
     assert.equal(reopened.run('currentIdx'), 1);
-    assert.equal(reopened.context.document.getElementById('resumeContinue').textContent, 'Czytaj od początku');
+    assert.equal(reopened.context.document.getElementById('resumeContinue').textContent, 'Od początku');
+    assert.equal(reopened.context.document.getElementById('resumeContinue').attributes['aria-label'], 'Czytaj ukończony dokument od początku');
     reopened.run('window.continueSavedDocument()'); await settle();
     assert.equal(reopened.run('currentIdx'), 0);
     assert.equal(reopened.run('isReading'), true);
@@ -1693,6 +1697,47 @@ test('UI-01 dialog importu zachowuje roboczy tekst i otwiera wybraną treść', 
     assert.equal(h.context.document.getElementById('fileInput').clickCount,1);
     assert.equal(dialog.open,false);
 });
+test('UI-01 dialog natywny można ponownie otworzyć po sukcesie, anulowaniu, błędzie i Escape', async () => {
+    let failUpload=false, imports=0;
+    const h=harness(async url=>{
+        if(url!=='/upload')return ok();
+        imports++;
+        if(failUpload)return {ok:false,status:503};
+        return {ok:true,json:async()=>({text:`Zaimportowany plik ${imports}.`,blocks:[]})};
+    });
+    const dialog=h.context.document.getElementById('addContentDialog');
+    const input=h.context.document.getElementById('fileInput');
+    async function upload(name) {
+        const file=new Blob([name]); file.name=name;
+        await input.listeners.change({target:{files:[file],value:name}});
+        await settle();
+    }
+    h.run('window.openAddContentDialog(); window.chooseFileImport()');
+    await upload('one.txt');
+    assert.equal(dialog.open,false);
+    assert.equal(dialog.hidden,false,'closing a native dialog does not set hidden');
+    h.run('window.openAddContentDialog()');
+    assert.equal(dialog.open,true,'first successful upload leaves the dialog reusable');
+    h.run('window.chooseFileImport()'); // File picker is cancelled; no change event follows.
+    h.run('window.openAddContentDialog()');
+    assert.equal(dialog.open,true,'cancelled file selection leaves the dialog reusable');
+    h.run('window.chooseFileImport()');
+    await upload('two.txt');
+    assert.equal(imports,2,'consecutive successful imports both reach the upload handler');
+    assert.equal(dialog.hidden,false);
+    failUpload=true;
+    h.run('window.openAddContentDialog(); window.chooseFileImport()');
+    await upload('broken.txt');
+    assert.equal(dialog.open,true,'upload errors reopen the import dialog with contextual status');
+    assert.match(h.context.document.getElementById('importStatus').textContent,/Nie udało się wczytać/);
+    dialog.dispatch('cancel'); // Native cancel is the event generated by Escape.
+    dialog.open=false;
+    dialog.dispatch('close');
+    h.run('window.openAddContentDialog()');
+    assert.equal(dialog.open,true,'Escape does not leave hidden set');
+    assert.equal(dialog.hidden,false);
+    assert.ok(dialog.showModalCalls>=5);
+});
 test('UI-01 przejście zdań w historii nie przewija ani nie przełącza widoku', async () => {
     const h=harness(async()=>ok());
     h.run('renderSentences("Pierwsze. Drugie.",[],{name:"Czytany dokument"}); window.startFrom(0)');
@@ -1701,6 +1746,24 @@ test('UI-01 przejście zdań w historii nie przewija ani nie przełącza widoku'
     h.audios.at(-1).onended(); await settle();
     assert.equal(h.run('activeTab'),'history');
     assert.equal(h.context.document.getElementById('sent-1').scrollCount||0,0);
+});
+test('UX-02 historia opisuje start, opcjonalny koniec i krótki czas odsłuchu', () => {
+    const h=harness(async()=>ok());
+    h.run(`historyDocuments=[]; historySessions=[
+        {id:'live',documentId:'gone-a',documentName:'Aktywna sesja',startedAt:Date.UTC(2026,10,15,10,0),playedMs:13000,status:'paused'},
+        {id:'done',documentId:'gone-b',documentName:'Krótka sesja',startedAt:Date.UTC(2026,10,15,11,0),endedAt:Date.UTC(2026,10,15,11,1),playedMs:65000,status:'completed'}
+    ]; selectedHistoryDay='2026-11-15'; renderHistory()`);
+    const rows=h.context.document.getElementById('historyList').children;
+    assert.equal(rows.length,2);
+    const liveMeta=rows[0].children[0].children[1].innerText;
+    assert.match(liveMeta,/Start:/);
+    assert.doesNotMatch(liveMeta,/Koniec:/);
+    assert.match(liveMeta,/Czas: 0:13/);
+    assert.doesNotMatch(liveMeta,/0 min/);
+    const doneMeta=rows[1].children[0].children[1].innerText;
+    assert.match(doneMeta,/Start:/);
+    assert.match(doneMeta,/Koniec:/);
+    assert.match(doneMeta,/Czas: 1:05/);
 });
 test('UI-01 ustawienia są opcjonalnym panelem z kontrolą stanu dostępności', () => {
     const h=harness(async()=>ok());
