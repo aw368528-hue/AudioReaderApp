@@ -19,11 +19,15 @@ function harness(fetch, query = '') {
     const documentListeners = {};
     let performanceTime = 0;
     class Audio {
-        constructor() { this.plays = 0; this.src = ''; audios.push(this); }
+        constructor() { this.plays = 0; this.src = ''; this.paused = true; this.ended = false;
+            this.currentTime = 0; this.duration = 12; this.readyState = 4; this.networkState = 1;
+            this.playbackRate = 1; this.listeners = {}; audios.push(this); }
         async play() { this.plays++; }
         pause() {}
         load() {}
         removeAttribute() { this.src = ''; }
+        addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
+        dispatch(type) { for (const callback of this.listeners[type] || []) callback({type}); }
     }
     let now = 0;
     const delays = [];
@@ -679,10 +683,10 @@ test('Raport mierzy playing zamiast play(), statystyki i widoczność bez tekstu
     assert.ok(h.run('diagnosticReport().events').some(e=>e.type==='visibility'));
     const copy = h.context.document.getElementById('diagnosticCopy');
     await copy.listeners.click();
-    assert.equal(JSON.parse(h.context.copied).schema, 'MOB-03A/1');
+    assert.equal(JSON.parse(h.context.copied).schema, 'MOB-04A/1');
     h.context.document.getElementById('diagnosticDownload').click();
     const exported = h.created.at(-1);
-    assert.equal(JSON.parse(await exported.blob.text()).schema, 'MOB-03A/1');
+    assert.equal(JSON.parse(await exported.blob.text()).schema, 'MOB-04A/1');
     assert.ok(!JSON.stringify(JSON.parse(await exported.blob.text())).includes(secret));
 });
 test('Raport rozdziela hidden/mixed i niedokończone lub anulowane przejścia', async () => {
@@ -703,6 +707,51 @@ test('Raport rozdziela hidden/mixed i niedokończone lub anulowane przejścia', 
     assert.equal(report.groups['buffer=0/mixed'].median_ms, 125);
     assert.equal(report.cancelled_transitions, 1);
     assert.equal(report.pending_transition, null);
+});
+test('Diagnostyka MOB-04A zapisuje zdarzenia i stan audio bez źródeł audio', async () => {
+    const secret = 'TAJNY TEKST test@example.com';
+    const h = harness(async()=>ok(), '?test=1&buffer=0');
+    h.run(`sentences=[${JSON.stringify(secret)}]; window.startFrom(0)`);
+    await settle();
+    h.run('audio.currentTime=1.25');
+    for (const type of ['pause','playing','waiting','stalled','suspend','ended','error']) {
+        h.run(`audio.dispatch(${JSON.stringify(type)})`);
+    }
+    h.run('audio.dispatch("timeupdate")');
+    h.advance(4999); h.run('audio.currentTime=2.5; audio.dispatch("timeupdate")');
+    assert.equal(h.run('diagnosticReport().events.filter(e=>e.type==="playback_progress").length'), 1);
+    h.advance(1); h.run('audio.currentTime=3.5; audio.dispatch("timeupdate")');
+    const report = h.run('diagnosticReport()');
+    assert.deepEqual(Array.from(report.events.filter(e=>e.type==='media_event'), e=>e.media_event),
+        ['pause','playing','waiting','stalled','suspend','ended','error']);
+    assert.ok(report.events.some(e=>e.type==='playback_progress' && e.player.current_time===1.25));
+    assert.ok(report.events.some(e=>e.type==='playback_progress' && e.player.current_time===3.5));
+    assert.ok(report.events.find(e=>e.type==='media_event').player.paused);
+    assert.ok(!JSON.stringify(report).includes(secret));
+    assert.ok(!JSON.stringify(report).includes('blob:'));
+});
+test('Kontrola po powrocie wykrywa brak postępu currentTime', async () => {
+    const h = harness(async()=>ok(), '?test=1');
+    h.run('sentences=["A."]; window.startFrom(0)'); await settle();
+    h.context.document.visibilityState='hidden'; h.documentListeners.visibilitychange();
+    h.context.document.visibilityState='visible'; h.documentListeners.visibilitychange();
+    await settle();
+    let checks = h.run('diagnosticReport().events.filter(e=>e.type==="visible_progress_check")');
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].playback_advanced, false);
+    h.context.document.visibilityState='hidden'; h.documentListeners.visibilitychange();
+    h.context.document.visibilityState='visible'; h.documentListeners.visibilitychange();
+    h.run('audio.currentTime=0.2'); h.advance(5000); await settle();
+    checks = h.run('diagnosticReport().events.filter(e=>e.type==="visible_progress_check")');
+    assert.equal(checks.length, 2);
+    assert.equal(checks[1].playback_advanced, true);
+    assert.equal(checks[1].current_time_delta, 0.2);
+});
+test('Zdarzenia odtwarzacza są wyłączone bez test=1', async () => {
+    const h = harness(async()=>ok(), '?test=0');
+    assert.equal(h.run('diagnostics'), null);
+    assert.equal(Object.keys(h.audios[0].listeners).length, 0);
+    assert.equal(h.run('diagnosticReport()'), null);
 });
 test('Przełącznik bufora i zmiana dokumentu czyszczą poprzednią sesję', async () => {
     const h=harness(async()=>ok(), '?test=1&buffer=2');

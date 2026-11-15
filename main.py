@@ -428,15 +428,44 @@ HTML_PAGE = """
     let attachedKey = null;
     let transition = null;
     const diagnostics = testMode ? {started: performance.now(), events: [], dropped: 0,
-        gaps: [], droppedGaps: 0, failed: 0, cancelled: 0, hits: 0, misses: 0} : null;
+        gaps: [], droppedGaps: 0, failed: 0, cancelled: 0, hits: 0, misses: 0,
+        observedPlayers: new WeakSet(), progressAt: new WeakMap(), visibleProbe: 0, visibleTimer: null} : null;
+
+    function playerSnapshot(player = audio) {
+        const numberOrNull = value => Number.isFinite(value) ? value : null;
+        return {paused: !!player.paused, ended: !!player.ended,
+            current_time: numberOrNull(player.currentTime), duration: numberOrNull(player.duration),
+            ready_state: Number.isFinite(player.readyState) ? player.readyState : null,
+            network_state: Number.isFinite(player.networkState) ? player.networkState : null,
+            playback_rate: numberOrNull(player.playbackRate),
+            media_error_code: player.error && Number.isFinite(player.error.code) ? player.error.code : null};
+    }
 
     function trace(type, fields = {}) {
         if (!diagnostics) return;
         if (diagnostics.events.length === 2000) { diagnostics.events.shift(); diagnostics.dropped++; }
         diagnostics.events.push({type, ms: performance.now() - diagnostics.started,
             session, index: currentIdx, buffer: bufferMode,
-            visibility: document.visibilityState || 'unknown', ...fields});
+            visibility: document.visibilityState || 'unknown', player: playerSnapshot(), ...fields});
     }
+
+    function observePlayer(player) {
+        if (!diagnostics || diagnostics.observedPlayers.has(player)) return;
+        diagnostics.observedPlayers.add(player);
+        for (const type of ['pause', 'playing', 'waiting', 'stalled', 'suspend', 'ended', 'error']) {
+            player.addEventListener(type, () => trace('media_event', {media_event: type,
+                player: playerSnapshot(player)}));
+        }
+        player.addEventListener('timeupdate', () => {
+            const now = performance.now();
+            const previous = diagnostics.progressAt.get(player) ?? -Infinity;
+            if (now - previous < 5000) return;
+            diagnostics.progressAt.set(player, now);
+            trace('playback_progress', {player: playerSnapshot(player)});
+        });
+    }
+
+    observePlayer(audio);
 
     function finishTransition(outcome) {
         if (!transition) return;
@@ -466,7 +495,7 @@ HTML_PAGE = """
         for (const mode of [0, 2]) for (const visibility of ['visible', 'hidden', 'mixed', 'unknown']) {
             groups[`buffer=${mode}/${visibility}`] = stats(diagnostics.gaps.filter(g => g.buffer === mode && g.visibility === visibility).map(g => g.ms));
         }
-        return {schema: 'MOB-03A/1', elapsed_ms: performance.now() - diagnostics.started,
+        return {schema: 'MOB-04A/1', elapsed_ms: performance.now() - diagnostics.started,
             buffer: bufferMode, limits: {fragments: CACHE_MAX_FRAGMENTS, bytes: CACHE_MAX_BYTES},
             gaps: stats(diagnostics.gaps.map(g => g.ms)), groups,
             failed_transitions: diagnostics.failed, cancelled_transitions: diagnostics.cancelled,
@@ -474,7 +503,7 @@ HTML_PAGE = """
             buffer_hits: diagnostics.hits, buffer_misses: diagnostics.misses,
             dropped_events: diagnostics.dropped, dropped_gap_samples: diagnostics.droppedGaps,
             cache: {fragments: prefetchCache.size, bytes: cacheBytes()},
-            note: 'Hidden nie oznacza jednoznacznie blokady ekranu. Przerwy mierzą callbacki ended/playing; pauzy użytkownika są wyłączone. Statystyki obejmują ostatnie 2000 próbek.',
+            note: 'Hidden nie potwierdza blokady ekranu. media_event zawiera stan odtwarzacza i currentTime. Po powrocie do widocznej strony wykonywany jest punkt kontrolny po 5 s; playback_advanced oznacza zmianę currentTime ponad 0,05 s. Przerwy ended/playing mierzą callbacki. Rejestrowanych jest maksymalnie 2000 zdarzeń.',
             events: diagnostics.events.map(event => ({...event}))};
     }
 
@@ -839,6 +868,7 @@ HTML_PAGE = """
         audio.removeAttribute('src');
         audio.load();
         audio = new Audio();
+        observePlayer(audio);
         attachedKey = null;
         clearAudioCache();
         for (const job of jobs.values()) {
@@ -870,12 +900,34 @@ HTML_PAGE = """
     if (testMode) {
         document.addEventListener('visibilitychange', () => {
             if (transition) transition.mixed = true;
+            const state = document.visibilityState || 'unknown';
             trace('visibility');
+            const probe = ++diagnostics.visibleProbe;
+            if (diagnostics.visibleTimer !== null) clearTimeout(diagnostics.visibleTimer);
+            diagnostics.visibleTimer = null;
+            if (state === 'visible') {
+                const player = audio;
+                const token = session;
+                const baseline = playerSnapshot(player);
+                const startedAt = performance.now();
+                diagnostics.visibleTimer = setTimeout(() => {
+                    if (probe !== diagnostics.visibleProbe || document.visibilityState !== 'visible') return;
+                    diagnostics.visibleTimer = null;
+                    const latest = playerSnapshot(player);
+                    const delta = baseline.current_time === null || latest.current_time === null
+                        ? null : latest.current_time - baseline.current_time;
+                    trace('visible_progress_check', {probe, session_unchanged: token === session,
+                        player_unchanged: player === audio, elapsed_ms: performance.now() - startedAt,
+                        current_time_before: baseline.current_time, current_time_after: latest.current_time,
+                        current_time_delta: delta, playback_advanced: delta !== null && delta > 0.05,
+                        checked_player: latest});
+                }, 5000);
+            }
         });
         const panel = document.createElement('div');
         panel.className = 'player-card';
         panel.style.flexShrink = '0';
-        panel.innerHTML = '<div>Test MOB-03A • raport lokalny, bez tekstu dokumentu</div><label>Bufor <select id="diagnosticBuffer"><option value="0">0 — bez prefetch</option><option value="2">2 — dwa fragmenty</option></select></label><div><button class="btn-tonal" id="diagnosticDownload">Pobierz raport JSON</button><button class="btn-tonal" id="diagnosticCopy">Kopiuj raport</button></div><small id="diagnosticResult">Hidden nie oznacza jednoznacznie blokady ekranu.</small>';
+        panel.innerHTML = '<div>Test MOB-04A • raport lokalny, bez tekstu dokumentu</div><label>Bufor <select id="diagnosticBuffer"><option value="0">0 — bez prefetch</option><option value="2">2 — dwa fragmenty</option></select></label><div><button class="btn-tonal" id="diagnosticDownload">Pobierz raport JSON</button><button class="btn-tonal" id="diagnosticCopy">Kopiuj raport</button></div><small id="diagnosticResult">Hidden nie oznacza jednoznacznie blokady ekranu.</small>';
         document.body.appendChild(panel);
         document.getElementById('diagnosticBuffer').value = String(bufferMode);
         document.getElementById('diagnosticBuffer').addEventListener('change', event => {
