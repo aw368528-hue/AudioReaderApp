@@ -298,13 +298,26 @@ class ReaderTests(unittest.TestCase):
         result = subprocess.run(['node', 'tests/ocr_probe.test.cjs'], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_ocr_app_camera_gallery_and_local_script(self):
+        page = self.client.get('/').text
+        self.assertIn('id="choosePhotoImport"', page)
+        self.assertIn('id="ocrCameraInput"', page)
+        self.assertIn('capture="environment"', page)
+        self.assertIn('id="ocrGalleryInput"', page)
+        self.assertIn('id="ocrText"', page)
+        self.assertIn('/ocr-probe-assets/app-ocr.js', page)
+        script = self.client.get('/ocr-probe-assets/app-ocr.js')
+        self.assertEqual(script.status_code, 200)
+        self.assertIn("createWorker('pol'", script.text)
+        self.assertNotIn("fetch('/upload'", script.text)
+
     def test_ui01_mobile_markup_and_responsive_contract(self):
         html = self.client.get('/').text
         self.assertIn('id="tabReader"', html)
         self.assertIn('id="tabHistory"', html)
         self.assertNotIn('id="tabEditor"', html)
         self.assertNotIn('id="editorView"', html)
-        self.assertNotIn('OCR', html)
+        self.assertIn('id="choosePhotoImport"', html)
         self.assertNotIn('pokrętło', html.lower())
         self.assertIn('id="addContentDialog"', html)
         self.assertIn('id="readerScroll"', html)

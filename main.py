@@ -200,11 +200,23 @@ HTML_PAGE = """
         .sheet-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
         .sheet-heading h2 { margin: 0; font-size: 1.05rem; }
         .sheet-close { width: 44px; height: 44px; border: 0; border-radius: 50%; color: var(--text); background: var(--surface-light); font-size: 1.2rem; }
-        .import-options { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
+        .import-options { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; }
         .import-options button { min-height: 64px; border: 1px solid var(--surface-light); border-radius: 14px; color: var(--text); background: var(--bg); font: inherit; font-weight: 600; }
         .text-import-form[hidden] { display: none; }
         .text-import-form { display: flex; min-height: min(45dvh, 340px); flex-direction: column; gap: 10px; }
         .text-import-form textarea { min-height: 150px; }
+        .ocr-import[hidden], .ocr-import textarea[hidden], .ocr-import canvas[hidden], .ocr-import progress[hidden] { display: none; }
+        .ocr-import { display: flex; flex-direction: column; gap: 10px; }
+        .ocr-choices { display: flex; flex-wrap: wrap; gap: 8px; }
+        .ocr-choices button, .ocr-actions button { min-height: 44px; border: 0; border-radius: 12px; padding: 9px 12px; color: var(--text); background: var(--surface-light); font: inherit; font-weight: 600; }
+        .ocr-choices button { flex: 1 1 145px; }
+        .ocr-import canvas { align-self: center; max-width: 100%; max-height: 32dvh; background: white; border-radius: 8px; }
+        .ocr-import progress { width: 100%; accent-color: var(--primary); }
+        .ocr-import textarea { flex: none; min-height: 170px; resize: vertical; }
+        .ocr-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+        .ocr-actions button { flex: 1 1 140px; }
+        .ocr-actions .apply-btn { margin-top: 0; color: white; background: var(--primary); }
+        .ocr-import button:disabled { opacity: .55; }
         .mini-player { display: flex; align-items: center; gap: 10px; min-height: 58px; flex: 0 0 auto; padding: 7px 10px; border: 1px solid var(--surface-light); border-radius: 16px; background: var(--surface); }
         .mini-player[hidden] { display: none; }
         .mini-player-main { display: flex; flex: 1 1 auto; min-width: 0; flex-direction: column; gap: 2px; cursor: pointer; }
@@ -220,6 +232,8 @@ HTML_PAGE = """
             .sheet-content { padding-bottom: max(18px, env(safe-area-inset-bottom)); }
         }
         @media (max-width: 480px) {
+            .import-options { grid-template-columns: 1fr; gap: 6px; }
+            .import-options button { min-height: 48px; }
             .history-toolbar { align-items: stretch; flex-direction: column; }
             .history-subnav { width: 100%; }
             .history-subnav button { flex: 1 1 0; white-space: nowrap; }
@@ -259,6 +273,8 @@ HTML_PAGE = """
     </div>
 
     <input type="file" id="fileInput" accept=".txt,.pdf,.docx" hidden>
+    <input type="file" id="ocrCameraInput" accept="image/jpeg,image/png,image/webp" capture="environment" hidden>
+    <input type="file" id="ocrGalleryInput" accept="image/jpeg,image/png,image/webp" hidden>
     <nav class="tabs" aria-label="Główna nawigacja">
         <button class="tab-btn active" id="tabReader" aria-current="page" onclick="window.switchTab('reader')">🎧 Lektor</button>
         <button class="tab-btn" id="tabHistory" onclick="window.switchTab('history')">📅 Historia</button>
@@ -301,12 +317,22 @@ HTML_PAGE = """
     <dialog class="add-content-dialog" id="addContentDialog" aria-labelledby="addContentTitle">
         <div class="sheet-content">
             <div class="sheet-heading"><h2 id="addContentTitle">Dodaj treść</h2><button class="sheet-close" aria-label="Zamknij" onclick="window.closeAddContentDialog()">×</button></div>
-            <div class="import-options"><button id="chooseFileImport" onclick="window.chooseFileImport()">📂 Wybierz PDF, DOCX lub TXT</button><button id="chooseTextImport" onclick="window.showTextImport()">📝 Wklej tekst</button></div>
+            <div class="import-options"><button id="chooseFileImport" onclick="window.chooseFileImport()">📂 Wybierz PDF, DOCX lub TXT</button><button id="chooseTextImport" onclick="window.showTextImport()">📝 Wklej tekst</button><button id="choosePhotoImport" onclick="window.showPhotoImport()">📷 Zdjęcie</button></div>
             <form class="text-import-form" id="textImportForm" hidden onsubmit="event.preventDefault(); window.applyText()">
                 <label for="rawText">Tekst do przeczytania</label>
                 <textarea id="rawText" placeholder="Wklej tutaj dowolny tekst do przeczytania..."></textarea>
                 <button class="apply-btn" type="submit">✔️ Czytaj tekst</button>
             </form>
+            <section class="ocr-import" id="ocrImport" aria-label="Rozpoznawanie tekstu ze zdjęcia" hidden>
+                <div class="ocr-choices"><button type="button" id="ocrCameraButton" onclick="window.chooseOcrPhoto('camera')">Zrób zdjęcie</button><button type="button" id="ocrGalleryButton" onclick="window.chooseOcrPhoto('gallery')">Wybierz z galerii</button></div>
+                <canvas id="ocrPreview" aria-label="Podgląd wybranego zdjęcia" hidden></canvas>
+                <div class="import-status" id="ocrStatus" role="status" aria-live="polite">Wybierz jedno zdjęcie. Rozpoznawanie odbywa się na telefonie.</div>
+                <progress id="ocrProgress" max="100" value="0" aria-label="Postęp rozpoznawania" hidden></progress>
+                <div class="ocr-actions"><button type="button" id="ocrRun" onclick="window.runOcr()" disabled>Rozpoznaj tekst</button><button type="button" id="ocrCancel" onclick="window.cancelOcrRecognition()" disabled>Anuluj</button></div>
+                <label for="ocrText" id="ocrTextLabel" hidden>Popraw rozpoznany tekst</label>
+                <textarea id="ocrText" aria-labelledby="ocrTextLabel" spellcheck="true" hidden></textarea>
+                <button class="apply-btn" type="button" id="ocrApply" onclick="window.applyOcrText()" hidden>✔️ Czytaj tekst</button>
+            </section>
             <div class="import-status" id="importStatus" role="status" aria-live="polite"></div>
         </div>
     </dialog>
@@ -336,6 +362,7 @@ HTML_PAGE = """
         </div>
     </div>
 
+<script src="/ocr-probe-assets/app-ocr.js"></script>
 <script>
     let sentences = [];
     let currentIdx = 0;
@@ -407,10 +434,25 @@ HTML_PAGE = """
         if (status) status.textContent = message;
     }
 
+    const ocrImport = typeof window.createOcrImport === 'function' ? window.createOcrImport({
+        getAction: () => resumeUserAction,
+        nextAction: () => ++resumeUserAction,
+        getRevision: () => resumeDocumentRevision,
+        commitText: text => {
+            resumeUserAction++;
+            renderSentences(text, [], {name: 'Tekst ze zdjęcia'});
+            window.closeAddContentDialog();
+            window.switchTab('reader');
+        }
+    }) : {reset() {}, active() { return false; }};
+    if (typeof window.showPhotoImport !== 'function')
+        window.showPhotoImport = () => setImportStatus('OCR jest chwilowo niedostępny. Wybierz plik lub wklej tekst.');
+
     window.openAddContentDialog = function() {
         const dialog = document.getElementById('addContentDialog');
         dialogReturnFocus = document.activeElement;
         document.getElementById('textImportForm').hidden = true;
+        ocrImport.reset();
         setImportStatus('');
         document.body.classList.add('modal-open');
         dialog.hidden = false;
@@ -420,6 +462,7 @@ HTML_PAGE = """
     };
 
     window.closeAddContentDialog = function() {
+        ocrImport.reset();
         const dialog = document.getElementById('addContentDialog');
         const nativeDialog = typeof dialog.showModal === 'function' && typeof dialog.close === 'function';
         if (nativeDialog) { if (dialog.open) dialog.close(); }
@@ -429,6 +472,7 @@ HTML_PAGE = """
     };
 
     window.showTextImport = function() {
+        ocrImport.reset();
         document.getElementById('textImportForm').hidden = false;
         document.getElementById('rawText').focus?.();
     };
@@ -442,15 +486,19 @@ HTML_PAGE = """
         if (event.target === document.getElementById('addContentDialog')) window.closeAddContentDialog();
     });
     document.getElementById('addContentDialog').addEventListener('close', () => {
+        ocrImport.reset();
         document.body.classList.remove('modal-open', 'keyboard-open');
         dialogReturnFocus?.focus?.();
     });
     document.getElementById('addContentDialog').addEventListener('cancel', () => {
+        ocrImport.reset();
         document.body.classList.remove('modal-open', 'keyboard-open');
         dialogReturnFocus?.focus?.();
     });
     document.getElementById('rawText').addEventListener('focus', () => document.body.classList.add('keyboard-open'));
     document.getElementById('rawText').addEventListener('blur', () => document.body.classList.remove('keyboard-open'));
+    document.getElementById('ocrText').addEventListener('focus', () => document.body.classList.add('keyboard-open'));
+    document.getElementById('ocrText').addEventListener('blur', () => document.body.classList.remove('keyboard-open'));
     if (typeof document.addEventListener === 'function') document.addEventListener('keydown', event => {
         if (event.key === 'Escape') window.toggleSettings(false);
     });
@@ -1188,6 +1236,8 @@ HTML_PAGE = """
 
     window.switchTab = function(tab) {
         if (tab === 'editor') { window.openAddContentDialog(); window.showTextImport(); return; }
+        if (document.getElementById('addContentDialog').open && !document.getElementById('ocrImport').hidden)
+            window.closeAddContentDialog();
         tab = tab === 'history' ? 'history' : 'reader';
         activeTab = tab;
         document.getElementById('readerView').style.display = tab === 'reader' ? 'flex' : 'none';
@@ -1214,6 +1264,7 @@ HTML_PAGE = """
     };
 
     function renderSentences(text, hints = [], options = {}) {
+        if (ocrImport.active()) ocrImport.reset();
         window.stopReading();
         if (!options.restored) resumeUserAction++;
         resumeDocumentRevision++;

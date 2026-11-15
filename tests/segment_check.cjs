@@ -3,6 +3,7 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const {script, cases} = JSON.parse(fs.readFileSync(0, 'utf8'));
+const ocrModule = fs.readFileSync('ocr_prototype/app-ocr.js', 'utf8');
 const nodes = new Map();
 const node = () => ({value: '', style: {}, children: [], classList: {add(){}, remove(){}, toggle(){}},
     addEventListener(){}, scrollIntoView(){}, appendChild(child){this.children.push(child);}});
@@ -16,6 +17,8 @@ const context=vm.createContext({window:{}, location:{search:""}, URLSearchParams
         assert.equal(url,'/tts');sent.push(options.body.get('text'));
         return {ok:true,blob:async()=>({size:10})};
     }});
+vm.runInContext(ocrModule,context);
+context.window.createOcrImport=context.createOcrImport;
 vm.runInContext(script,context);
 context.document.getElementById('voiceSelect').value='pl-PL-ZofiaNeural';
 context.document.getElementById('rateSlider').value='0';
