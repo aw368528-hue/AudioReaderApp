@@ -1,0 +1,16 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('ocr_prototype/probe.js', 'utf8');
+const context = vm.createContext({});
+vm.runInContext(source, context);
+const {distance, score, MODEL_BYTES, MAX_FILE_BYTES} = context.ocrProbeMetrics;
+assert.equal(distance('kot', 'kot'), 0);
+assert.equal(distance('kot', 'koc'), 1);
+assert.equal(score('Zażółć gęślą', 'Zażółć gęślą').cer, 0);
+assert.equal(score('Ala ma kota', 'Ala ma psa').wer, 1 / 3);
+assert.equal(score('', 'tekst'), null);
+assert.equal(MODEL_BYTES, 2026921);
+assert.equal(MAX_FILE_BYTES, 12 * 1024 * 1024);
+assert.ok(!source.includes("fetch('/upload'"));
+console.log('OCR probe metrics and privacy guard: OK');

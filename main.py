@@ -9,10 +9,12 @@ from email.utils import parsedate_to_datetime
 import socket
 import tempfile
 import os
+from pathlib import Path
 import docx
 import edge_tts
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from pypdf import PdfReader
 import uvicorn
@@ -20,6 +22,12 @@ from aiohttp import ClientError, ClientResponseError, ClientConnectorError
 from edge_tts.exceptions import NoAudioReceived
 
 app = FastAPI()
+OCR_PROBE_DIR = Path(__file__).resolve().parent / "ocr_prototype"
+app.mount("/ocr-probe-assets", StaticFiles(directory=OCR_PROBE_DIR), name="ocr-probe-assets")
+
+@app.get("/ocr-probe", include_in_schema=False)
+async def ocr_probe():
+    return FileResponse(OCR_PROBE_DIR / "index.html", media_type="text/html")
 TTS_VERSION = version("edge-tts")
 TTS_LOG = logging.getLogger("uvicorn.error.tts")
 TTS_LOG.setLevel(logging.INFO)

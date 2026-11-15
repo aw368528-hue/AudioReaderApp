@@ -2,6 +2,7 @@ import io
 import asyncio
 import json
 import logging
+import hashlib
 from pathlib import Path
 import subprocess
 import unittest
@@ -276,6 +277,22 @@ class ReaderTests(unittest.TestCase):
         result = subprocess.run(['node', 'tests/reader.test.cjs'], input=script, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         print(result.stdout.strip())
+
+    def test_ocr_probe_isolated_assets_and_metrics(self):
+        page = self.client.get('/ocr-probe')
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('OCR-01 — pomiar na Xiaomi 14T', page.text)
+        self.assertNotIn('id="addContentDialog"', page.text)
+        script = self.client.get('/ocr-probe-assets/probe.js')
+        self.assertEqual(script.status_code, 200)
+        self.assertNotIn("fetch('/upload'", script.text)
+        model = self.client.get('/ocr-probe-assets/pol.traineddata.gz')
+        self.assertEqual(model.status_code, 200)
+        self.assertEqual(len(model.content), 2026921)
+        self.assertEqual(hashlib.sha256(model.content).hexdigest(),
+                         'ffeedad4581eb8fdfcd7a6ad8c8103354fc7b70c8f01c611c8c1e7f93a56cf82')
+        result = subprocess.run(['node', 'tests/ocr_probe.test.cjs'], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_ui01_mobile_markup_and_responsive_contract(self):
         html = self.client.get('/').text
