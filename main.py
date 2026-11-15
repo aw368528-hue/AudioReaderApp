@@ -276,6 +276,7 @@ HTML_PAGE = """
     let resumeWriteQueue = Promise.resolve();
     let resumeDocumentRevision = 0;
     let resumeUserAction = 0;
+    let librarySelectionRevision = 0;
     let lastProgressSaveAt = 0;
     let lastProgressSavedIndex = null;
     let resumeWriteSequence = 0;
@@ -547,10 +548,15 @@ HTML_PAGE = """
     }
 
     async function openLibraryDocument(id) {
+        if (deletedDocumentIds.has(id)) return;
+        const selection = ++librarySelectionRevision;
+        const action = ++resumeUserAction;
+        const revision = resumeDocumentRevision;
         try {
             const record=await readDocumentById(id);
-            if (!record || !validResumeRecord(record)) return;
-            resumeUserAction++;
+            if (selection !== librarySelectionRevision || action !== resumeUserAction ||
+                revision !== resumeDocumentRevision || deletedDocumentIds.has(id) ||
+                !record || !validResumeRecord(record) || speechSegments(record.text,record.blocks).length !== record.sentenceCount) return;
             resumeStoredRecord=record;
             document.getElementById('rawText').value=record.text;
             if (record.voice) document.getElementById('voiceSelect').value=record.voice;
@@ -569,6 +575,7 @@ HTML_PAGE = """
         if (wasCurrent) { finishListeningSession('stopped'); window.stopReading(); }
         deletedDocumentIds.add(id);
         if (wasCurrent) resumeDocumentRevision++;
+        const deletionRevision=resumeDocumentRevision;
         resumeWriteQueue=resumeWriteQueue.catch(()=>{}).then(async()=>{
             const db=await openResumeDatabase();
             await new Promise((resolve,reject)=>{
@@ -578,7 +585,12 @@ HTML_PAGE = """
                 const all=tx.objectStore(SESSION_STORE).getAll();
                 all.onsuccess=()=> (all.result||[]).filter(item=>item.documentId===id).forEach(item=>tx.objectStore(SESSION_STORE).delete(item.id));
             });
-            if (wasCurrent) { currentDocument=null; sentences=[]; document.getElementById('readerView').innerHTML=''; resumeMessage('Dokument usunięty','Treść, postęp i historia dokumentu zostały usunięte z tej przeglądarki.'); }
+            if (wasCurrent && currentDocument?.id===id && resumeDocumentRevision===deletionRevision) {
+                currentDocument=null;
+                sentences=[];
+                document.getElementById('readerView').innerHTML='';
+                resumeMessage('Dokument usunięty','Treść, postęp i historia dokumentu zostały usunięte z tej przeglądarki.');
+            }
             await renderLibrary();
         }).catch(()=>resumeMessage('Nie udało się usunąć dokumentu','Pamięć lokalna jest niedostępna.'));
         return resumeWriteQueue;
@@ -1031,7 +1043,8 @@ HTML_PAGE = """
     document.getElementById('fileInput').addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        resumeUserAction++;
+        const importAction=++resumeUserAction;
+        const importRevision=resumeDocumentRevision;
         setStatus(`⏳ Wysyłanie pliku (${file.name})...`);
         const formData = new FormData();
         formData.append('file', file);
@@ -1040,6 +1053,7 @@ HTML_PAGE = """
             const res = await fetch('/upload', { method: 'POST', body: formData });
             if (!res.ok) throw new Error('Błąd serwera HTTP ' + res.status);
             const data = await res.json();
+            if (importAction !== resumeUserAction || importRevision !== resumeDocumentRevision) return;
             if (data.error) throw new Error(data.error);
 
             document.getElementById('rawText').value = data.text;
@@ -1048,6 +1062,7 @@ HTML_PAGE = """
             window.switchTab('reader');
             setStatus(`✔️ Wczytano plik: ${file.name}`);
         } catch (err) {
+            if (importAction !== resumeUserAction || importRevision !== resumeDocumentRevision) return;
             alert('Błąd wczytywania pliku: ' + err.message);
             setStatus('❌ Błąd odczytu pliku');
             if (!currentDocument) restoreSavedDocument();
@@ -1159,7 +1174,9 @@ HTML_PAGE = """
 
     function observePlaybackPause(player) {
         if (typeof player.addEventListener !== 'function') return;
+        const observedSession=session;
         player.addEventListener('playing', () => {
+            if (player !== audio || observedSession !== session || !isReading || isPaused || !currentDocument?.id) return;
             beginListeningSession();
             setMediaPlaybackState('playing');
         });
@@ -1938,6 +1955,7 @@ HTML_PAGE = """
     };
 
     window.stopReading = function() {
+        resumeUserAction++;
         finishTransition('cancelled');
         trace('stop');
         saveResumeProgress(true);

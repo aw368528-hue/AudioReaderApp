@@ -13,6 +13,7 @@ function memoryIndexedDB() {
     const sessions = new Map();
     const stores = new Map([['documents', data]]);
     const control = {data, sessions, stores, failWrites: 0, holdNextReadwriteGet: false, releaseHeldRead: null,
+        holdReadonlyGetKey: null, releaseHeldReadonlyGet: null, holdNextReadwriteDelete: false, releaseHeldDelete: null,
         oldVersion: 0, simulateUpgradeAbort: false};
     function objectStore(name, mode, tx) {
         const records = stores.get(name);
@@ -24,6 +25,9 @@ function memoryIndexedDB() {
                 if (mode === 'readwrite' && control.holdNextReadwriteGet) {
                     control.holdNextReadwriteGet = false;
                     control.releaseHeldRead = run;
+                } else if (mode === 'readonly' && control.holdReadonlyGetKey === key) {
+                    control.holdReadonlyGetKey = null;
+                    control.releaseHeldReadonlyGet = run;
                 } else run();
                 return request;
             },
@@ -43,7 +47,13 @@ function memoryIndexedDB() {
                 }, tx);
                 return request;
             },
-            delete(key) { schedule(() => { records.delete(key); }, tx); }
+            delete(key) {
+                const run=()=>schedule(()=>{records.delete(key);},tx);
+                if (mode !== 'readonly' && control.holdNextReadwriteDelete) {
+                    control.holdNextReadwriteDelete=false;
+                    control.releaseHeldDelete=run;
+                } else run();
+            }
         };
     }
     function schedule(callback, tx) {
@@ -1311,7 +1321,8 @@ test('UX-02 zapisuje odsłuch dopiero na playing i grupuje pauzę ze wznowieniem
     const startedAt=item.startedAt;
     h.run('audio.paused=true; audio.dispatch("pause")'); await settle();
     assert.equal([...idb.sessions.values()][0].status,'paused');
-    h.run('audio.paused=false; audio.dispatch("playing")'); await settle();
+    h.run('window.togglePlay()'); await settle();
+    h.run('audio.dispatch("playing")'); await settle();
     assert.equal(idb.sessions.size,1,'resume remains in the same grouped session');
     item=[...idb.sessions.values()][0];
     assert.equal(item.startedAt,startedAt);
@@ -1353,11 +1364,77 @@ test('UX-02 dwa dokumenty zachowują niezależny postęp i usunięcie kasuje ich
     await h.run(`openLibraryDocument(${JSON.stringify(firstId)})`); await settle();
     assert.equal(h.run('currentDocument.id'),firstId);
     assert.equal(h.run('currentIdx'),1);
+    h.run('window.startFrom(1)'); await settle();
     h.run('audio.dispatch("playing")'); await settle();
     assert.equal(idb.sessions.size,1);
     await h.run(`deleteLibraryDocument(${JSON.stringify(firstId)})`); await settle();
     assert.equal(idb.data.has(firstId),false);
     assert.equal([...idb.sessions.values()].some(item=>item.documentId===firstId),false);
+});
+test('UX-02 opóźnione usunięcie A nie czyści ani nie nadpisuje nowo otwartego B', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Dokument A.",[],{name:"A.txt"})'); await settle();
+    const idA=h.run('currentDocument.id');
+    h.run('renderSentences("Dokument B.",[],{name:"B.txt"})'); await settle();
+    const idB=h.run('currentDocument.id');
+    await h.run(`openLibraryDocument(${JSON.stringify(idA)})`); await settle();
+    idb.holdNextReadwriteDelete=true;
+    const deletion=h.run(`deleteLibraryDocument(${JSON.stringify(idA)})`);
+    await settle();
+    assert.equal(typeof idb.releaseHeldDelete,'function','delete transaction is paused before completion');
+    await h.run(`openLibraryDocument(${JSON.stringify(idB)})`); await settle();
+    assert.equal(h.run('currentDocument.id'),idB);
+    idb.releaseHeldDelete();
+    await deletion; await settle();
+    assert.equal(h.run('currentDocument.id'),idB,'late delete completion cannot clear the newer reader document');
+    assert.equal(h.run('currentDocument.text'),'Dokument B.');
+    assert.equal(idb.data.has(idB),true,'newly opened B remains stored after queued writes settle');
+    assert.equal(idb.data.has(idA),false);
+});
+test('UX-02 spóźniony odczyt biblioteki i import nie nadpisują nowszego wyboru', async () => {
+    const idb=memoryIndexedDB();
+    let finishImport;
+    const h=harness(async url=>url==='/upload'
+        ? new Promise(resolve=>{finishImport=resolve;}) : ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Dokument A.",[],{name:"A.txt"})'); await settle();
+    const idA=h.run('currentDocument.id');
+    h.run('renderSentences("Dokument B.",[],{name:"B.txt"})'); await settle();
+    const idB=h.run('currentDocument.id');
+    idb.holdReadonlyGetKey=idA;
+    const openA=h.run(`openLibraryDocument(${JSON.stringify(idA)})`);
+    await settle();
+    assert.equal(typeof idb.releaseHeldReadonlyGet,'function','A library read is deliberately delayed');
+    await h.run(`openLibraryDocument(${JSON.stringify(idB)})`); await settle();
+    idb.releaseHeldReadonlyGet();
+    await openA; await settle();
+    assert.equal(h.run('currentDocument.id'),idB,'older library selection cannot replace the newer selection');
+
+    const file=new Blob(['input']); file.name='spozniony.txt';
+    const pendingImport=h.context.document.getElementById('fileInput').listeners.change({target:{files:[file]}});
+    await settle();
+    await h.run(`openLibraryDocument(${JSON.stringify(idA)})`); await settle();
+    finishImport({ok:true,json:async()=>({text:'Późny import.',blocks:[]})});
+    await pendingImport; await settle();
+    assert.equal(h.run('currentDocument.id'),idA,'late import cannot replace the newer library choice');
+    assert.equal([...idb.data.values()].some(item=>item.name==='spozniony.txt'),false);
+});
+test('UX-02 spóźnione playing starego odtwarzacza nie zapisuje sesji nowego dokumentu', async () => {
+    const idb=memoryIndexedDB();
+    const h=harness(async()=>ok(),' ',true,null,idb);
+    await settle();
+    h.run('renderSentences("Dokument A.",[],{name:"A.txt"}); window.startFrom(0)'); await settle();
+    const oldPlayer=h.audios.at(-1);
+    h.run('renderSentences("Dokument B.",[],{name:"B.txt"})'); await settle();
+    const idB=h.run('currentDocument.id');
+    oldPlayer.dispatch('playing'); await settle();
+    assert.equal(idb.sessions.size,0,'a detached player event does not create an entry');
+    h.run('window.startFrom(0)'); await settle();
+    h.audios.at(-1).dispatch('playing'); await settle();
+    assert.equal(idb.sessions.size,1);
+    assert.equal([...idb.sessions.values()][0].documentId,idB,'only actual playback of B is recorded');
 });
 test('UX-02 jeden dokument pojawia się w historii dwóch lokalnych dni', async () => {
     const idb=memoryIndexedDB();
