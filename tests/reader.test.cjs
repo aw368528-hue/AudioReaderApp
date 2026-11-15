@@ -2157,6 +2157,84 @@ test('OCR-02 kadr jest niezależny dla każdej strony i OCR otrzymuje przycięte
     await h.run('window.recognizeScanPages()');
     assert.deepEqual(seen.at(-1),{marker:'B',width:1000,height:2000});
 });
+test('OCR-02 nie uruchamia OCR ani retry po powrocie do niezatwierdzonego kadru', async () => {
+    const seen=[];
+    let fail=true;
+    const h=harness(async()=>ok(),' ',true,null,null,{
+        createImageBitmap:async file=>({width:1000,height:2000,tag:file.tag,close(){}}),
+        tesseract:{async createWorker(){return {recognize:async image=>{
+            seen.push({width:image.width,height:image.height});
+            if (fail) { fail=false; throw Error('temporary OCR error'); }
+            return {data:{text:'Tekst z kadru.'}};
+        },terminate:async()=>{}};}}});
+    h.run('window.openAddContentDialog(); window.showDocumentScanner()');
+    const get=id=>h.context.document.getElementById(id);
+    await get('scanGalleryInput').listeners.change({target:{files:[scanPhoto('page')],value:'photo'}});
+    await scanButton(h,0,'Kadr').listeners.click();
+    const selection=get('scanCropSelection');
+    selection.dispatch('pointerdown',{target:{dataset:{scanHandle:'n'}},pointerId:7,clientX:180,clientY:0,preventDefault(){}});
+    selection.dispatch('pointermove',{pointerId:7,clientX:180,clientY:36,preventDefault(){}});
+    selection.dispatch('pointerup',{pointerId:7});
+    h.run('window.applyScanCrop()');
+    assert.equal(get('scanAppliedPreview').height,1900);
+    await h.run('window.recognizeScanPages()');
+    assert.deepEqual(seen,[{width:1000,height:1900}]);
+    assert.match(scanRows(h)[0].children[1].children[1].textContent,/Błąd OCR/);
+    h.run('window.changeScanCrop()');
+    assert.match(scanRows(h)[0].children[1].children[1].textContent,/Kadr do zatwierdzenia/);
+    assert.equal(get('scanRecognize').disabled,true);
+    assert.equal(scanButton(h,0,'Ponów OCR').disabled,true);
+    await h.run('window.recognizeScanPages()');
+    await scanButton(h,0,'Ponów OCR').listeners.click();
+    assert.deepEqual(seen,[{width:1000,height:1900}],'neither entry point processes the whole photo');
+    assert.match(get('scanStatus').textContent,/Potwierdź kadr/);
+    h.run('window.applyScanCrop()');
+    assert.equal(get('scanRecognize').disabled,false);
+    await scanButton(h,0,'Ponów OCR').listeners.click();
+    assert.deepEqual(seen,[{width:1000,height:1900},{width:1000,height:1900}]);
+});
+test('OCR-02 błąd ładowania biblioteki nie udaje zakończenia i pozwala ponowić', async () => {
+    let scripts=0, workers=0;
+    const h=harness(async()=>ok(),' ',true,null,null,{onScript(script,window){
+        scripts++;
+        if (scripts===1) { script.onerror(); return; }
+        window.Tesseract={async createWorker(){workers++;return {
+            recognize:async()=>({data:{text:'Odzyskany tekst.'}}),terminate:async()=>{}};}};
+        script.onload();
+    }});
+    h.run('window.openAddContentDialog(); window.showDocumentScanner()');
+    const get=id=>h.context.document.getElementById(id);
+    await get('scanGalleryInput').listeners.change({target:{files:[scanPhoto('page')],value:'photo'}});
+    await h.run('window.recognizeScanPages()');
+    assert.match(get('scanStatus').textContent,/Nie można uruchomić OCR/);
+    assert.doesNotMatch(get('scanStatus').textContent,/OCR zakończony/);
+    assert.equal(get('scanRecognize').disabled,false);
+    assert.equal(get('scanRead').disabled,true);
+    assert.match(scanRows(h)[0].children[1].children[1].textContent,/czeka na OCR/);
+    await h.run('window.recognizeScanPages()');
+    assert.equal(scripts,2);
+    assert.equal(workers,1);
+    assert.match(get('scanStatus').textContent,/OCR zakończony/);
+    assert.equal(get('scanRead').disabled,false);
+});
+test('OCR-02 błąd tworzenia workera zachowuje komunikat i retry', async () => {
+    let attempts=0;
+    const h=harness(async()=>ok(),' ',true,null,null,{tesseract:{async createWorker(){
+        attempts++;
+        if (attempts===1) throw Error('worker unavailable');
+        return {recognize:async()=>({data:{text:'Odzyskany tekst.'}}),terminate:async()=>{}};
+    }}});
+    h.run('window.openAddContentDialog(); window.showDocumentScanner()');
+    const get=id=>h.context.document.getElementById(id);
+    await get('scanCameraInput').listeners.change({target:{files:[scanPhoto('page')],value:'photo'}});
+    await h.run('window.recognizeScanPages()');
+    assert.match(get('scanStatus').textContent,/Nie można uruchomić OCR/);
+    assert.doesNotMatch(get('scanStatus').textContent,/OCR zakończony/);
+    assert.equal(get('scanRecognize').disabled,false);
+    await h.run('window.recognizeScanPages()');
+    assert.equal(attempts,2);
+    assert.equal(get('scanRead').disabled,false);
+});
 test('OCR-02 anulowanie zachowuje gotowe strony, a błąd pozwala ponowić jedną stronę', async () => {
     const seen=[];
     let resolveB, workers=0, terminations=0, failB=true;

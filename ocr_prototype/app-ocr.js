@@ -454,6 +454,7 @@
         const validSession = token => active && token === generation &&
             action === callbacks.getAction() && revision === callbacks.getRevision();
         const validRun = (token, run) => validSession(token) && run === runGeneration && busy;
+        const needsCropConfirmation = page => page.dirty || (!page.applied && !isFullCrop(page.crop));
         const edited = page => page?.text !== null && page?.text !== page?.recognizedText;
         const confirmPageReset = page => !edited(page) ||
             window.confirm('Zmiana tej strony usunie ręczne poprawki jej tekstu. Kontynuować?');
@@ -475,7 +476,7 @@
             el('scanCameraButton').disabled = adding || busy || pages.length >= MAX_PAGES;
             el('scanGalleryButton').disabled = adding || busy || pages.length >= MAX_PAGES;
             el('scanRecognize').disabled = !active || adding || busy || !pages.length ||
-                pages.some(page => page.dirty) || pages.every(page => page.text !== null && !page.error);
+                pages.some(needsCropConfirmation) || pages.every(page => page.text !== null && !page.error);
             el('scanCancel').disabled = !busy;
             el('scanRead').disabled = !active || adding || busy || !pages.length ||
                 pages.some(page => !page.text?.trim());
@@ -504,8 +505,8 @@
                 title.textContent = `Strona ${index + 1}`;
                 details.appendChild(title);
                 const status = document.createElement('small');
-                status.textContent = page.error ? 'Błąd OCR — ponów tę stronę' : page.dirty ?
-                    'Kadr do zatwierdzenia' : page.text === null ?
+                status.textContent = needsCropConfirmation(page) ? 'Kadr do zatwierdzenia' : page.error ?
+                    'Błąd OCR — ponów tę stronę' : page.text === null ?
                     (page.applied ? 'Kadr gotowy ✓ · czeka na OCR' : 'Całe zdjęcie · czeka na OCR') :
                     page.text.trim() ? (edited(page) ? 'Poprawiony tekst ✓' : 'Tekst gotowy ✓') :
                     'Brak tekstu — popraw ręcznie';
@@ -521,7 +522,8 @@
                 actions.appendChild(button('Kadr', () => openPage(page.id), busy || adding));
                 actions.appendChild(button('Edytuj tekst', () => openEditor(page.id), busy || adding));
                 if (page.error || page.text === '')
-                    actions.appendChild(button('Ponów OCR', () => recognizePages([page.id]), busy || adding || page.dirty));
+                    actions.appendChild(button('Ponów OCR', () => recognizePages([page.id]),
+                        busy || adding || needsCropConfirmation(page)));
                 actions.appendChild(button('Ponów zdjęcie', () => retakePage(page.id), busy || adding));
                 actions.appendChild(button('Usuń', () => removePage(page.id), busy || adding));
                 details.appendChild(actions);
@@ -857,8 +859,9 @@
         async function prepareInput(page, token, run) {
             let bitmap, source, input;
             try {
+                if (needsCropConfirmation(page)) return null;
                 bitmap = await decodeBitmap(page.file);
-                if (!validRun(token, run)) return null;
+                if (!validRun(token, run) || needsCropConfirmation(page)) return null;
                 source = document.createElement('canvas');
                 drawBitmap(bitmap, source);
                 if (page.applied) {
@@ -874,7 +877,11 @@
             } finally { bitmap?.close(); }
         }
         async function recognizePages(ids) {
-            if (!active || adding || busy || !pages.length || pages.some(page => page.dirty)) return;
+            if (!active || adding || busy || !pages.length) return;
+            if (pages.some(needsCropConfirmation)) {
+                setStatus('Potwierdź kadr strony przed uruchomieniem OCR.');
+                return;
+            }
             const targets = ids ? ids.map(pageById).filter(Boolean) :
                 pages.filter(page => page.text === null || page.error);
             if (!targets.length) return;
@@ -886,6 +893,7 @@
             el('scanProgress').value = 0;
             let timeout;
             let progressIndex = 0;
+            let startupFailed = false, cropBlocked = false;
             try {
                 const cancelled = new Promise((_, reject) => { cancelReject = reject; });
                 await Promise.race([loadLibrary(), cancelled]);
@@ -915,7 +923,8 @@
                     let input;
                     try {
                         input = await prepareInput(page, token, run);
-                        if (!input || !validRun(token, run)) break;
+                        if (!validRun(token, run)) break;
+                        if (!input) { cropBlocked = true; break; }
                         const timedOut = new Promise((_, reject) => { timeout = setTimeout(() =>
                             reject(new Error('timeout')), OCR_TIMEOUT_MS); });
                         const result = await Promise.race([worker.recognize(input), cancelled, timedOut]);
@@ -941,7 +950,10 @@
                     }
                 }
             } catch {
-                if (validRun(token, run)) setStatus('Nie można uruchomić OCR. Spróbuj ponownie.');
+                if (validRun(token, run)) {
+                    startupFailed = true;
+                    setStatus('Nie można uruchomić OCR. Spróbuj ponownie.');
+                }
             } finally {
                 clearTimeout(timeout);
                 if (validRun(token, run)) {
@@ -951,8 +963,11 @@
                     el('scanProgress').hidden = true;
                     renderPages();
                     const failures = pages.filter(page => page.error).length;
-                    if (failures) setStatus(`OCR zakończony. Błędy: ${failures}. Ponów OCR tylko dla błędnych stron.`);
-                    else setStatus('OCR zakończony. Popraw tekst stron i wybierz „Czytaj dokument”.');
+                    if (cropBlocked) setStatus('Potwierdź kadr strony przed uruchomieniem OCR.');
+                    else if (!startupFailed && failures)
+                        setStatus(`OCR zakończony. Błędy: ${failures}. Ponów OCR tylko dla błędnych stron.`);
+                    else if (!startupFailed)
+                        setStatus('OCR zakończony. Popraw tekst stron i wybierz „Czytaj dokument”.');
                 }
             }
         }
