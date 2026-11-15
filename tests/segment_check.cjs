@@ -25,7 +25,7 @@ context.document.getElementById('rateSlider').value='0';
         vm.runInContext('renderSentences(input, hints)',context);
         const segments=Array.from(vm.runInContext('sentences',context));
         assert.deepEqual(segments,item.expected,item.name);
-        const displayed=Array.from(context.document.getElementById('readerView').children).slice(-segments.length);
+        const displayed=Array.from(context.document.getElementById('sentenceList').children).slice(-segments.length);
         assert.deepEqual(displayed.map(element=>element.innerText.replace(/\s+/gu,' ').trim()),segments,`${item.name}: display matches TTS`);
         assert.equal(segments.join(' '),item.text.replace(/\s+/gu,' ').trim(),`${item.name}: lossless content/order`);
         assert.ok(!segments.some(text=>/^\d+\.$/.test(text)),`${item.name}: standalone label`);

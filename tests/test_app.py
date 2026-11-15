@@ -277,6 +277,29 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         print(result.stdout.strip())
 
+    def test_ui01_mobile_markup_and_responsive_contract(self):
+        html = self.client.get('/').text
+        self.assertIn('id="tabReader"', html)
+        self.assertIn('id="tabHistory"', html)
+        self.assertNotIn('id="tabEditor"', html)
+        self.assertNotIn('id="editorView"', html)
+        self.assertNotIn('OCR', html)
+        self.assertNotIn('pokrętło', html.lower())
+        self.assertIn('id="addContentDialog"', html)
+        self.assertIn('id="miniPlayer"', html)
+        self.assertIn('id="calendarToggle"', html)
+        self.assertIn('id="libraryToggle"', html)
+        self.assertIn('viewport-fit=cover', html)
+        self.assertNotIn('user-scalable=no', html)
+        self.assertIn('height: 100dvh', html)
+        self.assertIn('max-width: 360px', html)
+        self.assertIn('max-width: 600px', html)
+        self.assertIn('max-height: 520px', html)
+        self.assertIn('orientation: landscape', html)
+        self.assertIn('env(safe-area-inset-bottom)', html)
+        self.assertIn('prefers-reduced-motion: reduce', html)
+        self.assertIn('min-height: 44px', html)
+
 
 if __name__ == '__main__':
     unittest.main()
