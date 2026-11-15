@@ -286,6 +286,10 @@ class ReaderTests(unittest.TestCase):
         script = self.client.get('/ocr-probe-assets/probe.js')
         self.assertEqual(script.status_code, 200)
         self.assertNotIn("fetch('/upload'", script.text)
+        for asset in ['metrics.js', 'metrics-worker.js']:
+            response = self.client.get('/ocr-probe-assets/' + asset)
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("fetch('/upload'", response.text)
         model = self.client.get('/ocr-probe-assets/pol.traineddata.gz')
         self.assertEqual(model.status_code, 200)
         self.assertEqual(len(model.content), 2026921)
