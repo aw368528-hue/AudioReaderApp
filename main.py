@@ -487,8 +487,7 @@ HTML_PAGE = """
                 <option value="pl-PL-MarekNeural">Marek (AI)</option>
             </select>
             <span>🚀 <b id="rateLabel">0%</b></span>
-            <input type="range" id="rateSlider" min="-50" max="50" step="10" value="0"
-                   oninput="document.getElementById('rateLabel').innerText = (this.value>=0?'+'+this.value:this.value)+'%'">
+            <input type="range" id="rateSlider" min="-50" max="50" step="10" value="0">
         </div>
     </div>
 
@@ -558,6 +557,35 @@ HTML_PAGE = """
     };
 
     try { if (localStorage.getItem('audioReaderTheme') === 'light') document.body.classList.add('light'); } catch {}
+
+    const TTS_PREFERENCES_KEY = 'audioReaderTtsPreferencesV1';
+    const TTS_VOICES = ['pl-PL-ZofiaNeural', 'pl-PL-MarekNeural'];
+    const validTtsRate = value => Number.isInteger(value) && value >= -50 && value <= 50 && value % 10 === 0;
+    function loadTtsPreferences() {
+        const defaults = {version: 1, lastVoice: TTS_VOICES[0], rates: {[TTS_VOICES[0]]: 0, [TTS_VOICES[1]]: 0}};
+        try {
+            const stored = JSON.parse(localStorage.getItem(TTS_PREFERENCES_KEY));
+            if (!stored || stored.version !== 1 || !stored.rates || typeof stored.rates !== 'object') return defaults;
+            if (TTS_VOICES.includes(stored.lastVoice)) defaults.lastVoice = stored.lastVoice;
+            for (const voice of TTS_VOICES) {
+                if (validTtsRate(stored.rates[voice])) defaults.rates[voice] = stored.rates[voice];
+            }
+        } catch {}
+        return defaults;
+    }
+    const ttsPreferences = loadTtsPreferences();
+    const voiceSelect = document.getElementById('voiceSelect');
+    const rateSlider = document.getElementById('rateSlider');
+    function showTtsRate() {
+        const rate = ttsPreferences.rates[voiceSelect.value];
+        rateSlider.value = String(rate);
+        document.getElementById('rateLabel').innerText = (rate > 0 ? '+' : '') + rate + '%';
+    }
+    function saveTtsPreferences() {
+        try { localStorage.setItem(TTS_PREFERENCES_KEY, JSON.stringify(ttsPreferences)); } catch {}
+    }
+    voiceSelect.value = ttsPreferences.lastVoice;
+    showTtsRate();
 
     function setImportStatus(message) {
         const status = document.getElementById('importStatus');
@@ -961,9 +989,6 @@ HTML_PAGE = """
                 !record || !validResumeRecord(record) || speechSegments(record.text,record.blocks).length !== record.sentenceCount) return;
             resumeStoredRecord=record;
             document.getElementById('rawText').value=record.text;
-            if (record.voice) document.getElementById('voiceSelect').value=record.voice;
-            document.getElementById('rateSlider').value=String(record.rate);
-            document.getElementById('rateLabel').innerText=(Number(record.rate)>=0?'+':'')+record.rate+'%';
             lastDocumentUseStamp = Math.max(lastDocumentUseStamp, Number(record.lastUsedAt) || 0);
             renderSentences(record.text,record.blocks,{name:record.name,restored:true,id:record.id,index:record.index,completed:record.completed,createdAt:record.createdAt,lastUsedAt:record.lastUsedAt});
             saveResumeProgress(true);
@@ -1201,9 +1226,6 @@ HTML_PAGE = """
             lastDocumentUseStamp = Math.max(lastDocumentUseStamp, Number(record.lastUsedAt) || 0);
             renderSentences(record.text, blocks, {name: record.name, restored: true, id: record.id,
                 createdAt: record.createdAt, lastUsedAt: record.lastUsedAt, index: record.index, completed: record.completed});
-            if (record.voice) document.getElementById('voiceSelect').value = record.voice;
-            document.getElementById('rateSlider').value = String(record.rate);
-            document.getElementById('rateLabel').innerText = (Number(record.rate) >= 0 ? '+' + record.rate : record.rate) + '%';
             paintRestoredPosition(record);
             setStatus(record.completed ? 'Dokument ukończony. Możesz zacząć od początku.' : 'Dokument przywrócony. Wybierz „Kontynuuj od tego miejsca”.');
             resumeMessage('Biblioteka lokalna', record.name, record);
@@ -2450,8 +2472,28 @@ HTML_PAGE = """
             if (paused) window.togglePlay();
         } else window.stopReading();
     }
-    document.getElementById('voiceSelect').addEventListener('change', settingsChanged);
-    document.getElementById('rateSlider').addEventListener('change', settingsChanged);
+    voiceSelect.addEventListener('change', () => {
+        if (!TTS_VOICES.includes(voiceSelect.value)) return;
+        ttsPreferences.lastVoice = voiceSelect.value;
+        showTtsRate();
+        saveTtsPreferences();
+        settingsChanged();
+    });
+    rateSlider.addEventListener('input', () => {
+        const rate = Number(rateSlider.value);
+        if (!validTtsRate(rate)) return;
+        ttsPreferences.rates[voiceSelect.value] = rate;
+        showTtsRate();
+        saveTtsPreferences();
+    });
+    rateSlider.addEventListener('change', () => {
+        const rate = Number(rateSlider.value);
+        if (!validTtsRate(rate)) return;
+        ttsPreferences.rates[voiceSelect.value] = rate;
+        showTtsRate();
+        saveTtsPreferences();
+        settingsChanged();
+    });
 
     registerMediaSessionActions();
 

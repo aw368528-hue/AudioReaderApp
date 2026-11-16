@@ -36,6 +36,13 @@
 - Podaj konkretne wyniki: liczby testów i błędy, pliki zmienione, gałąź, commit/PR, rzeczy niezweryfikowane oraz procedurę ręcznego sprawdzenia na Xiaomi 14T.
 - Odróżniaj **testy automatyczne**, **wdrożenie Render** i **test manualny na telefonie**. Jeden nie potwierdza automatycznie drugiego.
 
+### Test rzeczywistej przeglądarki
+
+- Po zmianach interfejsu, JavaScript, stanu zapisywanego w przeglądarce albo przepływu użytkownika uruchom `python tests/browser_app.py --browser edge` na Windows. Skrypt startuje lokalny serwer z **bieżącego kodu** i steruje prawdziwym Edge (Chromium) przez Playwright. Dla zainstalowanego Chrome użyj `--browser chrome`; dla Chromium `--browser chromium`. Playwright jest zależnością wyłącznie developerską: `python -m pip install --user playwright`; wariant Chromium wymaga też `python -m playwright install chromium`.
+- Gdy Xiaomi 14T jest dostępny w `adb devices -l`, uruchom również `python tests/browser_app.py --android`. Skrypt uruchamia Chrome, jeśli trzeba, i łączy się przez ADB forward oraz Chrome DevTools Protocol; ADB reverse udostępnia lokalny serwer telefonowi. Przy kilku urządzeniach dodaj `--serial <numer>`. Na Windows ADB może być w `C:\Users\aw368\AppData\Local\Android\Sdk\platform-tools\adb.exe` poza `PATH`. Test otwiera i zamyka własną kartę na lokalnym adresie; nie resetuj telefonu ani nie usuwaj danych.
+- Do obu komend można dodać `--artifacts <katalog>`. Wynik `result.json` zawiera PASS/FAIL i błędy; `server.log` zawiera log lokalnego serwera, a `screen.png` zrzut interfejsu. Skrypt zbiera wyjątki JavaScript, błędy konsoli, nieudane żądania i odpowiedzi HTTP co najmniej 400 (z wyjątkiem nieistniejącego favicon). Bez `--artifacts` zapisuje pliki w katalogu tymczasowym i wypisuje ścieżkę. Nie dołączaj do raportów prywatnych dokumentów ani treści TTS.
+- PASS potwierdza tylko faktycznie wykonane asercje skryptu. Po zmianie funkcji dodaj do testu właściwe kroki i asercje, a następnie wykonaj go na zmienionej wersji. Odsłuch, jakość głosu, wygoda obsługi, działanie przy zablokowanym ekranie i inne oceny zmysłowe wymagają osobnego testu ręcznego właściciela. Raportuj osobno wyniki automatyczne i ręczne; przy błędzie podaj etap, komunikat, ścieżki diagnostyki i konkretną przeszkodę środowiskową. Nigdy nie deklaruj zaliczenia testu, którego nie uruchomiono.
+
 ## 5. Komunikacja i aktualizacja stanu
 
 - Raportuj krótko i rzeczowo: **co zrobiono → co sprawdzono → co pozostało → czy potrzebna decyzja właściciela**. Nie powtarzaj w raporcie całego tego pliku.
