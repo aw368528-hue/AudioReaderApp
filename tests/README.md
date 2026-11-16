@@ -8,6 +8,21 @@ Test JavaScript uruchamia w Node.js kod strony zwrócony przez FastAPI,
 z atrapami DOM, odtwarzacza, sieci i skróconymi opóźnieniami ponowień.
 Nie zastępuje testów prawdziwego audio i przeglądarki na Renderze.
 
+Test rzeczywistego interfejsu bieżącej wersji aplikacji (Playwright, lokalny
+serwer uruchamiany przez skrypt):
+
+    python -m pip install --user playwright
+    python tests/browser_app.py --browser edge
+    python tests/browser_app.py --android
+
+Na Windows `edge` używa zainstalowanego Edge Chromium; dostępne są także
+`--browser chrome` i `--browser chromium` (ten drugi wymaga
+`python -m playwright install chromium`). Wariant `--android` korzysta z ADB,
+Chrome na telefonie i CDP. Opcja `--artifacts <katalog>` zachowuje `result.json`,
+`server.log` i `screen.png`; bez niej skrypt używa katalogu tymczasowego.
+Test obejmuje import tekstu, osobne tempa głosów, odświeżenie i otwarcie
+starszego dokumentu z biblioteki. Odsłuch i jakość głosu wymagają oceny ręcznej.
+
 TXT-01: pełna ścieżka importu i dokładna treść formularzy TTS są sprawdzane
 przez segment_check.cjs i syntetyczne pliki w tests/fixtures. Opcjonalny test
 rzeczywistych zdarzeń audio w Chromium (z atrapą syntezy WAV):

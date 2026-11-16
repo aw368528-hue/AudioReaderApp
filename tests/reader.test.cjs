@@ -102,6 +102,11 @@ function memoryIndexedDB() {
 }
 function harness(fetch, query = '', withMediaSession = true, mseSupport = null, indexedDBApi = null, ocrOptions = {}) {
     const elements = new Map();
+    const storageData = new Map();
+    const localStorage = ocrOptions.localStorage || {
+        getItem: key => storageData.has(key) ? storageData.get(key) : null,
+        setItem: (key, value) => storageData.set(key, String(value)),
+    };
     function element() {
         const classes = new Set();
         return {value: '', style: {setProperty(name,value){this[name]=value;}}, innerText: '', innerHTML: '', children: [], hidden: false, attributes: {}, clickCount: 0,
@@ -176,7 +181,7 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
         ...(ocrOptions.visualViewport ? {visualViewport:ocrOptions.visualViewport} : {}),
         ...(indexedDBApi ? {indexedDB: indexedDBApi} : {}),
         ...(ocrOptions.tesseract ? {Tesseract: ocrOptions.tesseract} : {})};
-    const context = vm.createContext({window, location: {search: query, origin: 'https://example.test'}, URLSearchParams, Blob, Event,
+    const context = vm.createContext({window, localStorage, location: {search: query, origin: 'https://example.test'}, URLSearchParams, Blob, Event,
         navigator: {clipboard: {writeText: async text => { context.copied = text; }}, ...(withMediaSession ? {mediaSession} : {})},
         MediaMetadata: class MediaMetadata { constructor(data) { Object.assign(this, data); } },
         performance: {now: () => performanceTime}, document: {body, visibilityState: 'visible',
@@ -221,10 +226,10 @@ function harness(fetch, query = '', withMediaSession = true, mseSupport = null, 
         window.createOcrImport = context.createOcrImport;
         window.createDocumentScanner = context.createDocumentScanner;
     }
-    vm.runInContext(script, context);
-    const run = code => vm.runInContext(code, context);
     context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
     context.document.getElementById('rateSlider').value = '0';
+    vm.runInContext(script, context);
+    const run = code => vm.runInContext(code, context);
     return {run, context, elements, audios, delays, revoked, created, documentListeners, windowListeners, mediaSession, mediaActions, mediaSources, sourceBuffers, indexedDBApi,
         advance(ms) { performanceTime += ms; }, setNow(ms) { now=ms; }};
 }
@@ -792,6 +797,86 @@ test('Zmiana głosu i tempa anuluje przygotowanie i zachowuje pauzę oraz indeks
     h.run('window.togglePlay()');
     await settle();
     assert.equal(h.run('audio.plays'), 1);
+});
+test('TTS-UX-01 osobne tempa i ostatni głos przetrwają ponowne otwarcie', () => {
+    const h = harness(async () => ok());
+    const voice = h.context.document.getElementById('voiceSelect');
+    const rate = h.context.document.getElementById('rateSlider');
+    const label = h.context.document.getElementById('rateLabel');
+    assert.equal(voice.value, 'pl-PL-ZofiaNeural');
+    assert.equal(rate.value, '0');
+    voice.value = 'pl-PL-MarekNeural'; voice.dispatch('change');
+    assert.equal(rate.value, '0', 'new Marek profile starts at zero');
+    rate.value = '-30'; rate.dispatch('input');
+    assert.equal(label.innerText, '-30%');
+    voice.value = 'pl-PL-ZofiaNeural'; voice.dispatch('change');
+    assert.equal(rate.value, '0');
+    rate.value = '20'; rate.dispatch('change');
+    voice.value = 'pl-PL-MarekNeural'; voice.dispatch('change');
+    assert.equal(rate.value, '-30');
+    assert.equal(label.innerText, '-30%');
+    const reopened = harness(async () => ok(), '', true, null, null,
+        {localStorage: h.context.localStorage});
+    assert.equal(reopened.context.document.getElementById('voiceSelect').value, 'pl-PL-MarekNeural');
+    assert.equal(reopened.context.document.getElementById('rateSlider').value, '-30');
+    reopened.context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
+    reopened.context.document.getElementById('voiceSelect').dispatch('change');
+    assert.equal(reopened.context.document.getElementById('rateSlider').value, '20');
+});
+test('TTS-UX-01 błędne preferencje i niedostępny storage dają poprawne wartości startowe', () => {
+    const entries = new Map([['audioReaderTtsPreferencesV1', '{broken']]);
+    const storage = {getItem: key => entries.get(key) ?? null,
+        setItem: (key, value) => entries.set(key, String(value))};
+    let h = harness(async () => ok(), '', true, null, null, {localStorage: storage});
+    assert.equal(h.context.document.getElementById('rateSlider').value, '0');
+    entries.set('audioReaderTtsPreferencesV1', JSON.stringify({version: 0,
+        lastVoice: 'pl-PL-MarekNeural', rates: {'pl-PL-MarekNeural': -30}}));
+    h = harness(async () => ok(), '', true, null, null, {localStorage: storage});
+    assert.equal(h.context.document.getElementById('voiceSelect').value, 'pl-PL-ZofiaNeural');
+    assert.equal(h.context.document.getElementById('rateSlider').value, '0');
+    entries.set('audioReaderTtsPreferencesV1', JSON.stringify({version: 1,
+        lastVoice: 'pl-PL-MarekNeural', rates: {'pl-PL-MarekNeural': -35, 'pl-PL-ZofiaNeural': 20}}));
+    h = harness(async () => ok(), '', true, null, null, {localStorage: storage});
+    assert.equal(h.context.document.getElementById('voiceSelect').value, 'pl-PL-MarekNeural');
+    assert.equal(h.context.document.getElementById('rateSlider').value, '0');
+    h.context.document.getElementById('voiceSelect').value = 'pl-PL-ZofiaNeural';
+    h.context.document.getElementById('voiceSelect').dispatch('change');
+    assert.equal(h.context.document.getElementById('rateSlider').value, '20');
+    const unavailable = {getItem() {throw Error('denied');}, setItem() {throw Error('denied');}};
+    h = harness(async () => ok(), '', true, null, null, {localStorage: unavailable});
+    h.context.document.getElementById('voiceSelect').value = 'pl-PL-MarekNeural';
+    h.context.document.getElementById('voiceSelect').dispatch('change');
+    h.context.document.getElementById('rateSlider').value = '-30';
+    h.context.document.getElementById('rateSlider').dispatch('change');
+    assert.equal(h.context.document.getElementById('rateSlider').value, '-30');
+});
+test('TTS-UX-01 stary rekord biblioteki nie nadpisuje preferencji i zachowuje indeks', async () => {
+    const idb = memoryIndexedDB();
+    const calls = [];
+    const h = harness(async (url, options) => {calls.push(Object.fromEntries(options.body)); return ok();},
+        '', true, null, idb);
+    await settle();
+    h.run('renderSentences("Pierwsze. Drugie.", [], {name:"stary.txt"})');
+    await settle();
+    const record = latestDocument(idb);
+    record.voice = 'pl-PL-MarekNeural'; record.rate = '-30'; record.index = 1;
+    const freshProfile = harness(async () => ok(), '', true, null, idb);
+    await settle();
+    assert.equal(freshProfile.context.document.getElementById('voiceSelect').value, 'pl-PL-ZofiaNeural');
+    assert.equal(freshProfile.context.document.getElementById('rateSlider').value, '0');
+    assert.equal(freshProfile.run('currentIdx'), 1);
+    const voice = h.context.document.getElementById('voiceSelect');
+    const rate = h.context.document.getElementById('rateSlider');
+    rate.value = '20'; rate.dispatch('change');
+    await h.run(`openLibraryDocument(${JSON.stringify(record.id)})`);
+    await settle();
+    assert.equal(voice.value, 'pl-PL-ZofiaNeural');
+    assert.equal(rate.value, '20');
+    assert.equal(h.run('currentIdx'), 1);
+    h.run('window.startFrom(1)'); await settle();
+    assert.equal(calls.at(-1).voice, 'pl-PL-ZofiaNeural');
+    assert.equal(calls.at(-1).rate, '20');
+    assert.equal(h.run('currentIdx'), 1);
 });
 test('Pauza podczas prefetch blokuje dalsze uzupełnianie i odtwarzanie', async () => {
     let finish;
@@ -1564,7 +1649,9 @@ test('UX-01 wklejony tekst i miejsce wracają lokalnie bez automatycznego odtwar
     const h = harness(async()=>ok(), '', true, null, idb);
     await settle();
     h.context.document.getElementById('voiceSelect').value = 'pl-PL-MarekNeural';
+    h.context.document.getElementById('voiceSelect').dispatch('change');
     h.context.document.getElementById('rateSlider').value = '20';
+    h.context.document.getElementById('rateSlider').dispatch('change');
     h.context.document.getElementById('rawText').value = 'Pierwsze zdanie. Drugie zdanie.';
     h.run('window.applyText()'); await settle();
     assert.equal(latestDocument(idb).name, 'Wklejony tekst');
@@ -1576,7 +1663,8 @@ test('UX-01 wklejony tekst i miejsce wracają lokalnie bez automatycznego odtwar
     assert.equal(latestDocument(idb).rate, '20');
 
     let reopenedFetches = 0;
-    const reopened = harness(async()=>{reopenedFetches++; return ok();}, '', true, null, idb);
+    const reopened = harness(async()=>{reopenedFetches++; return ok();}, '', true, null, idb,
+        {localStorage: h.context.localStorage});
     await settle();
     assert.deepEqual(Array.from(reopened.run('sentences')), ['Pierwsze zdanie.', 'Drugie zdanie.']);
     assert.equal(reopened.run('currentIdx'), 1);
